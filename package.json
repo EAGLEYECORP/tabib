@@ -1,0 +1,1 @@
+{"name":"tabib-ma","private":true,"scripts":{"dev":"next dev","build":"next build","start":"next start","test":"playwright test"},"dependencies":{"@supabase/ssr":"latest","@supabase/supabase-js":"latest","next":"latest","react":"latest","react-dom":"latest"},"devDependencies":{"@playwright/test":"latest","typescript":"latest"}}
