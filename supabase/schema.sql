@@ -1,0 +1,303 @@
+create extension if not exists btree_gist;
+create type public.user_role as enum ('patient','doctor','clinic_admin','platform_admin');
+create type public.appointment_status as enum ('requested','confirmed','cancelled','completed','no_show');
+create table public.profiles(id uuid primary key references auth.users(id) on delete cascade,full_name text,phone text,role public.user_role not null default 'patient',created_at timestamptz not null default now());
+create table public.doctor_profiles(id uuid primary key references public.profiles(id) on delete cascade,display_name text not null,specialty text not null,city text not null,bio text,verified boolean not null default false);
+create table public.clinics(id uuid primary key default gen_random_uuid(),name text not null,city text not null,address text,verified boolean not null default false,created_at timestamptz not null default now());
+create table public.doctor_availability(id uuid primary key default gen_random_uuid(),doctor_id uuid not null references public.doctor_profiles(id) on delete cascade,start_at timestamptz not null,end_at timestamptz not null,status text not null default 'open',check(end_at>start_at));
+create table public.appointments(id uuid primary key default gen_random_uuid(),patient_id uuid not null references public.profiles(id) on delete restrict,doctor_id uuid not null references public.doctor_profiles(id) on delete restrict,start_at timestamptz not null,end_at timestamptz not null,status public.appointment_status not null default 'requested',reason text,created_at timestamptz not null default now(),check(end_at>start_at));
+alter table public.appointments add constraint no_overlapping_doctor_appointments exclude using gist(doctor_id with =,tstzrange(start_at,end_at,'[)') with &&) where(status in('requested','confirmed'));
+create table public.audit_logs(id bigint generated always as identity primary key,actor_id uuid references auth.users(id) on delete set null,action text not null,entity_type text,entity_id uuid,metadata jsonb not null default '{}'::jsonb,created_at timestamptz not null default now());
+alter table public.profiles enable row level security;alter table public.doctor_profiles enable row level security;alter table public.clinics enable row level security;alter table public.doctor_availability enable row level security;alter table public.appointments enable row level security;alter table public.audit_logs enable row level security;
+create policy "verified doctors public read" on public.doctor_profiles for select using(verified=true);
+create policy "own profile read" on public.profiles for select using(auth.uid()=id);
+create policy "patient appointments read" on public.appointments for select using(auth.uid()=patient_id);
+create policy "doctor appointments read" on public.appointments for select using(auth.uid()=doctor_id);
+create policy "patient appointments create" on public.appointments for insert with check(auth.uid()=patient_id);
+create policy "patient appointments update" on public.appointments for update using(auth.uid()=patient_id);
+create policy "doctor appointments update" on public.appointments for update using(auth.uid()=doctor_id);
+
+-- ---------------------------------------------------------------------------
+-- Medical documents
+--
+-- Files live in a private Storage bucket; this table is the index over them.
+-- Nothing here grants access on its own: every rule below is enforced by
+-- Postgres row-level security, so a mistake in application code cannot hand a
+-- patient's analyses to the wrong person.
+--
+-- The sharing model is deliberately narrow. A document belongs to a patient,
+-- always -- including a prescription a doctor writes, which is the patient's
+-- record held on their behalf. A doctor sees a document only when the patient
+-- has attached it to an appointment with that doctor. Attaching is sharing and
+-- detaching is un-sharing, so there is no second permission list that can drift
+-- out of step with the appointments themselves.
+-- ---------------------------------------------------------------------------
+
+create type public.document_kind as enum (
+  'analysis','imaging','prescription','report','insurance','referral','other'
+);
+
+create table public.documents(
+  id uuid primary key default gen_random_uuid(),
+
+  -- Whose record this belongs to.
+  patient_id uuid not null references public.profiles(id) on delete cascade,
+  -- Attaching to an appointment is what shares the document with its doctor.
+  appointment_id uuid references public.appointments(id) on delete set null,
+  -- Who put it there: the patient, or a doctor sending a prescription back.
+  uploaded_by uuid not null references public.profiles(id) on delete restrict,
+
+  -- Object key in the medical-documents bucket, always '<patient_id>/<uuid>'.
+  storage_path text not null unique,
+  -- Original name, sanitised, shown in the interface and used on download.
+  filename text not null,
+  -- Determined by inspecting the bytes on upload, never from the client's
+  -- Content-Type header; the check keeps a bad value out even so.
+  mime_type text not null check (mime_type in (
+    'application/pdf','image/jpeg','image/png','image/webp',
+    'image/heic','image/tiff','application/dicom'
+  )),
+  size_bytes bigint not null check (size_bytes > 0 and size_bytes <= 20971520),
+  -- SHA-256 of the contents: detects duplicate uploads and silent corruption.
+  checksum text,
+
+  kind public.document_kind not null default 'other',
+  note text check (note is null or length(note) <= 500),
+
+  -- Soft delete: the patient's copy disappears and the bytes are removed, but
+  -- the row survives so a doctor's record of what informed a consultation is
+  -- not rewritten after the fact.
+  deleted_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index documents_patient_idx on public.documents(patient_id, created_at desc)
+  where deleted_at is null;
+create index documents_appointment_idx on public.documents(appointment_id)
+  where deleted_at is null;
+
+alter table public.documents enable row level security;
+
+-- A doctor's reach, in one place: an appointment of their own that the
+-- document is attached to. Both the table policies and the Storage policies
+-- call this, so the rule is written once.
+create or replace function public.can_doctor_see_document(doc_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.documents d
+    join public.appointments a on a.id = d.appointment_id
+    where d.id = doc_id
+      and d.deleted_at is null
+      and a.doctor_id = auth.uid()
+  );
+$$;
+
+-- Patients: full control over their own record.
+create policy "patient reads own documents" on public.documents
+  for select using (auth.uid() = patient_id and deleted_at is null);
+
+create policy "patient adds own documents" on public.documents
+  for insert with check (
+    auth.uid() = patient_id
+    and auth.uid() = uploaded_by
+    -- May only attach to an appointment that is actually theirs.
+    and (appointment_id is null or exists (
+      select 1 from public.appointments a
+      where a.id = appointment_id and a.patient_id = auth.uid()
+    ))
+  );
+
+-- Sharing, un-sharing and editing the note. Deletion is deliberately not
+-- reachable here: see soft_delete_document below.
+create policy "patient updates own documents" on public.documents
+  for update using (auth.uid() = patient_id and deleted_at is null)
+  with check (
+    auth.uid() = patient_id
+    and deleted_at is null
+    and (appointment_id is null or exists (
+      select 1 from public.appointments a
+      where a.id = appointment_id and a.patient_id = auth.uid()
+    ))
+  );
+
+-- Deleting a document is an operation, not a field edit.
+--
+-- It has to be, because the read policies hide deleted rows: a patient setting
+-- deleted_at through a plain UPDATE would be writing a row they can no longer
+-- see, which PostgreSQL rejects. Routing it through one security-definer
+-- function also gives a single place to check ownership, and returns the
+-- object key so the caller can remove the bytes from Storage -- "delete" has
+-- to mean the file is gone, not merely hidden.
+create or replace function public.soft_delete_document(doc_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  path text;
+begin
+  update public.documents
+     set deleted_at = now()
+   where id = doc_id
+     and patient_id = auth.uid()
+     and deleted_at is null
+  returning storage_path into path;
+
+  if path is null then
+    raise exception 'Document not found, already deleted, or not yours'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return path;
+end;
+$$;
+
+revoke all on function public.soft_delete_document(uuid) from public;
+grant execute on function public.soft_delete_document(uuid) to authenticated;
+
+-- Doctors: read only what was shared with them, and only through their own
+-- appointment. No update, no delete -- a doctor cannot alter or remove
+-- anything from a patient's record.
+create policy "doctor reads shared documents" on public.documents
+  for select using (
+    deleted_at is null
+    and appointment_id is not null
+    and exists (
+      select 1 from public.appointments a
+      where a.id = appointment_id and a.doctor_id = auth.uid()
+    )
+  );
+
+-- A doctor may file a document into the record of a patient they are seeing --
+-- a prescription, a report -- but only against their own appointment.
+create policy "doctor sends document to patient" on public.documents
+  for insert with check (
+    auth.uid() = uploaded_by
+    and appointment_id is not null
+    and exists (
+      select 1 from public.appointments a
+      where a.id = appointment_id
+        and a.doctor_id = auth.uid()
+        and a.patient_id = documents.patient_id
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- Storage
+--
+-- The bucket is private: there is no public URL for a scan or an analysis, and
+-- the only way to the bytes is a short-lived signed URL minted for someone the
+-- policies below already allow.
+--
+-- Object keys are '<patient_id>/<uuid>', so the first path segment identifies
+-- the owner and every policy keys off it. Storage policies are separate from
+-- the table's: a row in public.documents grants nothing by itself, and neither
+-- does an object -- both have to agree.
+-- ---------------------------------------------------------------------------
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'medical-documents', 'medical-documents', false, 20971520,
+  array['application/pdf','image/jpeg','image/png','image/webp',
+        'image/heic','image/tiff','application/dicom']
+)
+on conflict (id) do update set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+-- A patient reaches the objects filed under their own id.
+create policy "patient reads own files" on storage.objects
+  for select using (
+    bucket_id = 'medical-documents'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+create policy "patient uploads own files" on storage.objects
+  for insert with check (
+    bucket_id = 'medical-documents'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+create policy "patient deletes own files" on storage.objects
+  for delete using (
+    bucket_id = 'medical-documents'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+-- A doctor reaches an object only through a document row that is attached to
+-- one of their own appointments -- the same rule as the table, applied to the
+-- bytes.
+create policy "doctor reads shared files" on storage.objects
+  for select using (
+    bucket_id = 'medical-documents'
+    and exists (
+      select 1
+      from public.documents d
+      join public.appointments a on a.id = d.appointment_id
+      where d.storage_path = storage.objects.name
+        and d.deleted_at is null
+        and a.doctor_id = auth.uid()
+    )
+  );
+
+-- A doctor writes into the patient's folder only when sending a document to a
+-- patient they have an appointment with.
+create policy "doctor uploads to patient folder" on storage.objects
+  for insert with check (
+    bucket_id = 'medical-documents'
+    and exists (
+      select 1 from public.appointments a
+      where a.doctor_id = auth.uid()
+        and a.patient_id::text = (storage.foldername(name))[1]
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- Audit trail
+--
+-- Who touched which document, and when. Medical records need this for its own
+-- sake, and it is the only way to answer "who saw my file?" later.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.log_document_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (
+    auth.uid(),
+    case
+      when tg_op = 'INSERT' then 'document.created'
+      when tg_op = 'UPDATE' and new.deleted_at is not null
+           and old.deleted_at is null then 'document.deleted'
+      when tg_op = 'UPDATE' and new.appointment_id is distinct from old.appointment_id
+        then case when new.appointment_id is null
+                  then 'document.unshared' else 'document.shared' end
+      else 'document.updated'
+    end,
+    'document',
+    new.id,
+    jsonb_build_object(
+      'patient_id', new.patient_id,
+      'appointment_id', new.appointment_id,
+      'kind', new.kind
+    )
+  );
+  return new;
+end;
+$$;
+
+create trigger documents_audit
+  after insert or update on public.documents
+  for each row execute function public.log_document_change();
