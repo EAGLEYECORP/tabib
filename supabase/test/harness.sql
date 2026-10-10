@@ -19,7 +19,10 @@ create schema if not exists storage;
 create table auth.users(
   id uuid primary key default gen_random_uuid(),
   email text,
-  phone text
+  phone text,
+  -- Supabase puts whatever the client passed at sign-up here; the
+  -- profile-creation trigger reads a name out of it.
+  raw_user_meta_data jsonb not null default '{}'::jsonb
 );
 
 -- Supabase derives the caller from the `sub` claim of the request JWT, which
@@ -80,12 +83,19 @@ $$;
 
 -- The role application requests run as. Policies do not apply to superusers,
 -- so the tests must connect as this one for any of it to mean anything.
+-- Supabase ships two: `anon` for a visitor who has not signed in, and
+-- `authenticated` for one who has. Both exist here because the schema grants
+-- to both, and because "can a signed-out visitor see this?" is a question the
+-- tests need to be able to ask.
 do $$
 begin
   if not exists (select 1 from pg_roles where rolname = 'authenticated') then
     create role authenticated nologin;
   end if;
+  if not exists (select 1 from pg_roles where rolname = 'anon') then
+    create role anon nologin;
+  end if;
 end
 $$;
 
-grant usage on schema public, auth, storage to authenticated;
+grant usage on schema public, auth, storage to authenticated, anon;

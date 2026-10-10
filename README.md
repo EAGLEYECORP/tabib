@@ -6,9 +6,11 @@ Next.js + Supabase + Vercel.
 ## What works today
 
 - **Search** verified practitioners by specialty and city.
-- **Appointments**, with overlapping bookings made impossible by the database
-  itself (a GiST exclusion constraint), not by application checks that can
-  lose a race.
+- **Booking**: a patient opens a practitioner's profile, sees free slots
+  grouped by day, picks one and confirms. Overlapping bookings are impossible
+  because the database says so (a GiST exclusion constraint), not because the
+  application checked first and hoped — when two patients submit the same slot
+  at the same moment, exactly one wins and the other is told to pick again.
 - **Medical documents**: a patient uploads analyses, radiology images or
   insurance forms, shares them with a practitioner by attaching them to an
   appointment, and withdraws the share at any time. A practitioner sends a
@@ -33,6 +35,38 @@ Two settings in the Supabase dashboard are needed for sign-in to work:
 **Authentication → Providers → Phone** must be enabled, with an SMS provider
 configured. Without one, `signInWithOtp` returns an error and nobody can log
 in.
+
+## How booking works
+
+Free slots are not a table. A practitioner opens blocks of consulting time in
+`doctor_availability`, each with its own consultation length, and
+`available_slots()` cuts those into slots, drops anything already taken,
+anything in the past, and anything inside the two-hour lead time a cabinet
+needs to know someone is coming.
+
+That function runs as its owner on purpose. Working out what is free means
+knowing which times are taken, but a patient must never read another
+patient's appointments — so the function can see every booking and returns
+only times, never who holds them.
+
+Three things had to be fixed before any of this could work:
+
+- `doctor_availability` had row-level security enabled and **no policies at
+  all**, which made it unreadable by everyone. No patient could ever have seen
+  a free slot.
+- **Nothing created the `public.profiles` row** when someone signed in, so a
+  first booking failed on a foreign key — a confusing way to learn your
+  account is half-created. A trigger on `auth.users` creates it now.
+- The appointment insert policy accepted **any timestamp at all**, so a
+  patient could have booked a doctor at three in the morning by posting a
+  chosen time. It now requires the slot to fall inside an advertised block and
+  to respect the lead time.
+
+Slots are shown in the cabinet's time zone, not the viewer's, so a patient
+booking from Paris sees the hour they are expected in Casablanca. The zone is
+resolved through the IANA database rather than a fixed `+01:00`: Morocco sits
+on UTC+1 year-round but returns to UTC for the month of Ramadan, so a
+hard-coded offset would show the wrong hour for several weeks a year.
 
 ## How document access is decided
 
@@ -73,7 +107,7 @@ consultation is not rewritten.
 ## Tests
 
 ```bash
-npm test          # 85 tests
+npm test          # 119 tests
 npm run typecheck
 npm run build
 ```
@@ -88,7 +122,8 @@ The suite has two halves:
   Supabase provides, including `auth.uid()` reading the JWT subject from the
   session.
 - **Application logic**: upload inspection, filename sanitisation, phone
-  normalisation, and the upload route's sequencing.
+  normalisation, slot grouping and time-zone handling, and the upload route's
+  sequencing.
 
 The RLS half needs a PostgreSQL 16 with `pgcrypto` and `btree_gist`, reached
 through the usual `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` variables.
@@ -108,17 +143,22 @@ apps/web/components/         Uploader and document list
 
 ## Not done yet
 
-- **Appointment booking from the UI.** The schema and the overlap constraint
-  are there; the patient-facing flow to pick a slot is not.
+- **Practitioners cannot open their own availability from the UI.** The table,
+  the policies and the slot function are there, and a doctor may write their
+  own rows, but the screen to manage opening hours is not built — blocks have
+  to be inserted directly for now.
 - **Arabic.** The interface is French only. The document and appointment data
   carry nothing language-specific, so this is a presentation change, but it is
   a real gap in this market.
 - **Practitioner onboarding.** `doctor_profiles.verified` is a flag someone
   sets by hand; nothing checks an INPE number against the CNOM register.
 - **Virus scanning.** Files are type-checked, not scanned.
-- **The browser flows are untested.** The RLS policies and the upload route
-  are covered; signing in and uploading through the interface has not been
-  exercised end to end, because that needs a live Supabase project.
+- **The browser flows are untested.** The database rules are covered
+  thoroughly — including two patients racing for one slot — and so is the
+  upload route. But signing in, picking a slot and uploading *through the
+  interface* has not been exercised end to end, because that needs a live
+  Supabase project. The pages render and every route returns what it should;
+  the click-path has not been walked.
 
 ## Important
 

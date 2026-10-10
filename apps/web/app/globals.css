@@ -40,3 +40,10 @@ select:focus,input:focus{outline:2px solid #172033;outline-offset:1px}
 .danger{color:#b42318}
 form.card{display:grid;gap:12px}
 .brand{text-decoration:none;color:#172033}.spaced{margin-left:10px}
+.days{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
+.day h3{font-size:15px;margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid #e4e7ec;text-transform:capitalize}
+.slots{list-style:none;padding:0;margin:0;display:grid;gap:7px}
+.slot{display:block;text-align:center;padding:9px;border:1px solid #cfd5e1;border-radius:9px;background:#fff;color:#172033;text-decoration:none;font-weight:600}
+.slot:hover{background:#172033;color:#fff;border-color:#172033}
+.struck{text-decoration:line-through}
+.muted-card{opacity:.72}

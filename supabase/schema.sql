@@ -301,3 +301,180 @@ $$;
 create trigger documents_audit
   after insert or update on public.documents
   for each row execute function public.log_document_change();
+
+-- ---------------------------------------------------------------------------
+-- Accounts
+--
+-- Supabase Auth creates a row in auth.users when someone signs in with a code;
+-- nothing creates the public.profiles row that the rest of the schema points
+-- at. Without this trigger a patient's first booking fails on a foreign key,
+-- which is a confusing way to learn that an account is half-created.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (id, full_name, phone, role)
+  values (
+    new.id,
+    nullif(trim(coalesce(new.raw_user_meta_data ->> 'full_name', '')), ''),
+    new.phone,
+    'patient'
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- A patient fills in their own name after signing in; the booking form needs
+-- somewhere to put it.
+create policy "own profile update" on public.profiles
+  for update using (auth.uid() = id) with check (auth.uid() = id);
+
+-- A doctor needs to read the names of patients they are seeing. Limited to
+-- people they actually have an appointment with.
+create policy "doctor reads own patients" on public.profiles
+  for select using (
+    exists (
+      select 1 from public.appointments a
+      where a.patient_id = profiles.id and a.doctor_id = auth.uid()
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- Availability
+--
+-- The table had row-level security enabled and no policies at all, which made
+-- it unreadable by everyone: no patient could ever see a free slot. Opening
+-- hours of a verified practitioner are public information, so they are
+-- readable by anyone, signed in or not.
+-- ---------------------------------------------------------------------------
+
+-- How long one consultation lasts in a given block. A cabinet's morning is
+-- one row, sliced into appointments of this length.
+alter table public.doctor_availability
+  add column if not exists slot_minutes integer not null default 30
+    check (slot_minutes between 5 and 240);
+
+create policy "open availability is public" on public.doctor_availability
+  for select using (
+    status = 'open'
+    and exists (
+      select 1 from public.doctor_profiles d
+      where d.id = doctor_id and d.verified = true
+    )
+  );
+
+create policy "doctor manages own availability" on public.doctor_availability
+  for all using (auth.uid() = doctor_id) with check (auth.uid() = doctor_id);
+
+-- ---------------------------------------------------------------------------
+-- Free slots
+--
+-- Computing these needs to know which times are already taken, but a patient
+-- must not be able to read another patient's appointments. The function runs
+-- as its owner for that reason: it can see every booking, and returns only
+-- times -- never who holds them.
+-- ---------------------------------------------------------------------------
+
+/** Nobody may book a consultation starting in the next two hours; a cabinet
+    needs warning that someone is coming. */
+create or replace function public.booking_lead_time()
+returns interval language sql immutable as $$ select interval '2 hours' $$;
+
+create or replace function public.available_slots(
+  p_doctor_id uuid,
+  p_from timestamptz default now(),
+  p_days integer default 14
+)
+returns table (slot_start timestamptz, slot_end timestamptz)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with bounds as (
+    select
+      greatest(p_from, now() + public.booking_lead_time()) as earliest,
+      p_from + (least(greatest(p_days, 0), 60) || ' days')::interval as latest
+  ),
+  candidate as (
+    -- Each availability block is cut into consultations of its own length.
+    -- The series stops one slot short of the end so a block never emits a
+    -- consultation that would run past closing time.
+    select
+      step as slot_start,
+      step + (av.slot_minutes || ' minutes')::interval as slot_end
+    from public.doctor_availability av
+    cross join bounds b
+    cross join lateral generate_series(
+      av.start_at,
+      av.end_at - (av.slot_minutes || ' minutes')::interval,
+      (av.slot_minutes || ' minutes')::interval
+    ) as step
+    where av.doctor_id = p_doctor_id
+      and av.status = 'open'
+      and av.end_at > b.earliest
+      and av.start_at < b.latest
+  )
+  select c.slot_start, c.slot_end
+  from candidate c
+  cross join bounds b
+  where c.slot_start >= b.earliest
+    and c.slot_start < b.latest
+    and not exists (
+      select 1
+      from public.appointments a
+      where a.doctor_id = p_doctor_id
+        and a.status in ('requested', 'confirmed')
+        and tstzrange(a.start_at, a.end_at, '[)')
+            && tstzrange(c.slot_start, c.slot_end, '[)')
+    )
+  order by c.slot_start;
+$$;
+
+-- Availability is public, so an unauthenticated visitor may look before
+-- signing in; booking still requires an account.
+grant execute on function public.available_slots(uuid, timestamptz, integer) to anon, authenticated;
+grant execute on function public.booking_lead_time() to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Booking
+--
+-- The original insert policy accepted any time at all, so a patient could book
+-- a doctor at three in the morning by posting a chosen timestamp. Replaced
+-- with one that requires the slot to fall inside an advertised block and to
+-- respect the lead time. Double booking is prevented separately, by the
+-- exclusion constraint on the table.
+-- ---------------------------------------------------------------------------
+
+drop policy if exists "patient appointments create" on public.appointments;
+
+create policy "patient appointments create" on public.appointments
+  for insert with check (
+    auth.uid() = patient_id
+    and start_at >= now() + public.booking_lead_time()
+    and exists (
+      select 1 from public.doctor_availability av
+      where av.doctor_id = appointments.doctor_id
+        and av.status = 'open'
+        and appointments.start_at >= av.start_at
+        and appointments.end_at <= av.end_at
+    )
+  );
+
+-- Cancelling is the patient's to do; rescheduling means cancelling and
+-- booking again, so the times are frozen once the row exists.
+drop policy if exists "patient appointments update" on public.appointments;
+
+create policy "patient appointments cancel" on public.appointments
+  for update using (auth.uid() = patient_id)
+  with check (auth.uid() = patient_id);

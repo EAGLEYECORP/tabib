@@ -46,6 +46,8 @@ class AsUser {
   constructor(
     private readonly client: Client,
     private readonly userId: string,
+    /** `anon` for a visitor who has not signed in. */
+    private readonly role: "authenticated" | "anon" = "authenticated",
   ) {}
 
   /**
@@ -56,7 +58,7 @@ class AsUser {
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
     await this.client.query("begin");
     try {
-      await this.client.query("set local role authenticated");
+      await this.client.query(`set local role ${this.role}`);
       await this.client.query("select set_config('request.jwt.claim.sub', $1, true)", [
         this.userId,
       ]);
@@ -72,6 +74,8 @@ class AsUser {
 
 let admin: Client;
 let session: Client;
+/** A second connection, so two patients can genuinely race for one slot. */
+let rival: Client;
 
 const ids = {
   patientA: "",
@@ -104,6 +108,7 @@ beforeAll(async () => {
   // wrong reason.
   await admin.query(`
     grant select, insert, update, delete on all tables in schema public to authenticated;
+    grant select on all tables in schema public to anon;
     grant select, insert, update, delete on storage.objects to authenticated;
     grant select on storage.buckets to authenticated;
     grant usage, select on all sequences in schema public to authenticated;
@@ -111,24 +116,32 @@ beforeAll(async () => {
 
   session = connect(DB);
   await session.connect();
+  rival = connect(DB);
+  await rival.connect();
 }, 60_000);
 
 beforeEach(async () => {
   await admin.query("delete from public.documents");
   await admin.query("delete from public.appointments");
+  await admin.query("delete from public.doctor_availability");
   await admin.query("delete from public.audit_logs");
   await admin.query("delete from storage.objects");
   await admin.query("delete from public.doctor_profiles");
   await admin.query("delete from public.profiles");
   await admin.query("delete from auth.users");
 
+  // The profile row is created by the on_auth_user_created trigger, exactly
+  // as it is in production; this only fills in the parts sign-up cannot know.
   const makeUser = async (role: string, name: string) => {
     const {
       rows: [user],
-    } = await admin.query<{ id: string }>("insert into auth.users default values returning id");
+    } = await admin.query<{ id: string }>(
+      "insert into auth.users (raw_user_meta_data) values (jsonb_build_object('full_name', $1::text)) returning id",
+      [name],
+    );
     await admin.query(
-      "insert into public.profiles (id, full_name, role) values ($1, $2, $3::public.user_role)",
-      [user.id, name, role],
+      "update public.profiles set role = $2::public.user_role where id = $1",
+      [user.id, role],
     );
     return user.id;
   };
@@ -173,6 +186,7 @@ beforeEach(async () => {
 
 afterAll(async () => {
   await session?.end();
+  await rival?.end();
   await admin?.end();
 });
 
@@ -502,6 +516,314 @@ describe("the files themselves", () => {
       "select public from storage.buckets where id = 'medical-documents'",
     );
     expect(rows[0].public).toBe(false);
+  });
+});
+
+
+/** Opens a block of consulting time for a doctor. */
+async function openAvailability(options: {
+  doctorId: string;
+  startsInHours: number;
+  lengthHours: number;
+  slotMinutes?: number;
+  status?: string;
+}): Promise<void> {
+  // Anchored to the minute, as a real cabinet's hours are. It also keeps the
+  // fixtures honest: node-pg hands back timestamptz as a JS Date, which has
+  // millisecond resolution, so microsecond-precision times would not survive
+  // being read as a slot and passed back as a booking.
+  await admin.query(
+    `insert into public.doctor_availability
+       (doctor_id, start_at, end_at, slot_minutes, status)
+     values ($1,
+             date_trunc('minute', now()) + ($2 || ' hours')::interval,
+             date_trunc('minute', now()) + (($2::numeric + $3::numeric) || ' hours')::interval,
+             $4, $5)`,
+    [
+      options.doctorId,
+      options.startsInHours,
+      options.lengthHours,
+      options.slotMinutes ?? 30,
+      options.status ?? "open",
+    ],
+  );
+}
+
+interface Slot {
+  slot_start: Date;
+  slot_end: Date;
+}
+
+function slotsFor(caller: AsUser, doctorId: string, days = 14) {
+  return caller.query<Slot>("select * from public.available_slots($1, now(), $2)", [
+    doctorId,
+    days,
+  ]);
+}
+
+describe("a new account", () => {
+  it("gets a profile, so the first booking does not fail on a foreign key", async () => {
+    const {
+      rows: [user],
+    } = await admin.query<{ id: string }>(
+      "insert into auth.users (phone) values ('+212600112233') returning id",
+    );
+    const { rows } = await admin.query<{ id: string; role: string; phone: string }>(
+      "select id, role, phone from public.profiles where id = $1",
+      [user.id],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].role).toBe("patient");
+    expect(rows[0].phone).toBe("+212600112233");
+  });
+});
+
+describe("seeing free slots", () => {
+  // The shared fixtures include appointments, which would silently eat slots
+  // out of the blocks opened here. Booking starts from an empty diary.
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+  });
+
+  it("cuts an availability block into consultations", async () => {
+    // A four-hour block in 30-minute consultations is eight slots.
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 4 });
+    const slots = await slotsFor(asPatientA, ids.doctorA);
+    expect(slots).toHaveLength(8);
+  });
+
+  it("honours the length the doctor set for that block", async () => {
+    await openAvailability({
+      doctorId: ids.doctorA,
+      startsInHours: 24,
+      lengthHours: 1,
+      slotMinutes: 20,
+    });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(3);
+  });
+
+  it("never offers a consultation running past closing time", async () => {
+    // 50 minutes of block in 20-minute consultations is two, not two and a bit.
+    await openAvailability({
+      doctorId: ids.doctorA,
+      startsInHours: 24,
+      lengthHours: 50 / 60,
+      slotMinutes: 20,
+    });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(2);
+  });
+
+  it("is visible to a visitor who has not signed in", async () => {
+    // Opening hours are public; you should not have to sign in to see whether
+    // a doctor has anything free this week.
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const anonymous = new AsUser(session, ids.patientA, "anon");
+    expect(await slotsFor(anonymous, ids.doctorA)).toHaveLength(2);
+  });
+
+  it("hides a block the doctor has closed", async () => {
+    await openAvailability({
+      doctorId: ids.doctorA,
+      startsInHours: 24,
+      lengthHours: 2,
+      status: "closed",
+    });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(0);
+  });
+
+  it("hides slots inside the lead time", async () => {
+    // A block starting in thirty minutes is too soon to book into.
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 0.5, lengthHours: 1 });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(0);
+  });
+
+  it("hides a block that has already passed", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: -48, lengthHours: 4 });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(0);
+  });
+
+  it("stops at the end of the window asked for", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24 * 20, lengthHours: 2 });
+    expect(await slotsFor(asPatientA, ids.doctorA, 7)).toHaveLength(0);
+    expect(await slotsFor(asPatientA, ids.doctorA, 30)).toHaveLength(4);
+  });
+
+  it("shows only the doctor being looked at", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    await openAvailability({ doctorId: ids.doctorB, startsInHours: 24, lengthHours: 1 });
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(2);
+  });
+
+  it("drops a slot once it is booked, without revealing who booked it", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 2 });
+    const before = await slotsFor(asPatientA, ids.doctorA);
+    expect(before).toHaveLength(4);
+
+    // Booked by somebody else entirely.
+    await admin.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2, $3, $4, 'confirmed')`,
+      [ids.patientB, ids.doctorA, before[1].slot_start, before[1].slot_end],
+    );
+
+    const after = await slotsFor(asPatientA, ids.doctorA);
+    expect(after).toHaveLength(3);
+    expect(after.map((s) => s.slot_start.getTime())).not.toContain(
+      before[1].slot_start.getTime(),
+    );
+    // And patient A still cannot read patient B's appointment itself.
+    expect(await asPatientA.query("select id from public.appointments")).toHaveLength(0);
+  });
+
+  it("frees the slot again when the appointment is cancelled", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const [slot] = await slotsFor(asPatientA, ids.doctorA);
+    const {
+      rows: [appointment],
+    } = await admin.query<{ id: string }>(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2, $3, $4, 'confirmed') returning id`,
+      [ids.patientB, ids.doctorA, slot.slot_start, slot.slot_end],
+    );
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(1);
+
+    await admin.query("update public.appointments set status = 'cancelled' where id = $1", [
+      appointment.id,
+    ]);
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(2);
+  });
+});
+
+describe("booking a slot", () => {
+  // The shared fixtures include appointments, which would silently eat slots
+  // out of the blocks opened here. Booking starts from an empty diary.
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+  });
+
+  it("is accepted when the slot is really on offer", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const [slot] = await slotsFor(asPatientA, ids.doctorA);
+
+    const rows = await asPatientA.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, reason)
+       values ($1, $2, $3, $4, 'Contrôle de tension') returning id`,
+      [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+    );
+    expect(rows).toHaveLength(1);
+  });
+
+  it("refuses a time the doctor never advertised", async () => {
+    // The original policy accepted any timestamp at all, so a patient could
+    // book a doctor at three in the morning.
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    await expect(
+      asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, now() + interval '72 hours', now() + interval '73 hours')`,
+        [ids.patientA, ids.doctorA],
+      ),
+    ).rejects.toThrow(/row-level security/i);
+  });
+
+  it("refuses a slot inside the lead time", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 0, lengthHours: 4 });
+    await expect(
+      asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, now() + interval '15 minutes', now() + interval '45 minutes')`,
+        [ids.patientA, ids.doctorA],
+      ),
+    ).rejects.toThrow(/row-level security/i);
+  });
+
+  it("refuses booking in someone else's name", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const [slot] = await slotsFor(asPatientA, ids.doctorA);
+    await expect(
+      asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4)`,
+        [ids.patientB, ids.doctorA, slot.slot_start, slot.slot_end],
+      ),
+    ).rejects.toThrow(/row-level security/i);
+  });
+
+  it("lets exactly one of two patients win the same slot", async () => {
+    // The guarantee the whole booking flow rests on. Both callers pass every
+    // application-level check; the exclusion constraint is what decides.
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const [slot] = await slotsFor(asPatientA, ids.doctorA);
+
+    const book = (caller: AsUser, patientId: string) =>
+      caller.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4)`,
+        [patientId, ids.doctorA, slot.slot_start, slot.slot_end],
+      );
+
+    // Two separate connections, so the inserts genuinely race.
+    const results = await Promise.allSettled([
+      book(asPatientA, ids.patientA),
+      book(new AsUser(rival, ids.patientB), ids.patientB),
+    ]);
+
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const loser = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(loser.reason)).toMatch(/no_overlapping_doctor_appointments|exclusion|conflict/i);
+
+    const { rows } = await admin.query("select id from public.appointments");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("refuses a second booking overlapping the first by part of a slot", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 2 });
+    const slots = await slotsFor(asPatientA, ids.doctorA);
+    await asPatientA.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+       values ($1, $2, $3, $4)`,
+      [ids.patientA, ids.doctorA, slots[0].slot_start, slots[0].slot_end],
+    );
+
+    // A fifteen-minute overlap is still a clash.
+    await expect(
+      admin.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3::timestamptz + interval '15 minutes',
+                 $4::timestamptz + interval '15 minutes')`,
+        [ids.patientB, ids.doctorA, slots[0].slot_start, slots[0].slot_end],
+      ),
+    ).rejects.toThrow(/no_overlapping_doctor_appointments|exclusion/i);
+  });
+
+  it("lets a patient cancel their own booking and nobody else's", async () => {
+    await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+    const [slot] = await slotsFor(asPatientA, ids.doctorA);
+    const {
+      rows: [appointment],
+    } = await admin.query<{ id: string }>(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2, $3, $4, 'confirmed') returning id`,
+      [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+    );
+
+    await asPatientB.query("update public.appointments set status = 'cancelled' where id = $1", [
+      appointment.id,
+    ]);
+    let { rows } = await admin.query<{ status: string }>(
+      "select status from public.appointments where id = $1",
+      [appointment.id],
+    );
+    expect(rows[0].status).toBe("confirmed");
+
+    await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+      appointment.id,
+    ]);
+    ({ rows } = await admin.query<{ status: string }>(
+      "select status from public.appointments where id = $1",
+      [appointment.id],
+    ));
+    expect(rows[0].status).toBe("cancelled");
   });
 });
 
