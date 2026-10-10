@@ -1,1 +1,18 @@
-export default function Home(){return <><header className="nav"><div className="brand">tabib.ma</div><nav><a href="/search">Médecins</a><a href="/dashboard">Mon espace</a></nav></header><main className="hero"><small>SANTÉ · MAROC</small><h1>Trouvez votre médecin.<br/>Prenez rendez-vous.</h1><p>Recherchez un praticien vérifié et consultez les disponibilités enregistrées dans Tabib.ma.</p><a className="button" href="/search">Rechercher un médecin</a></main></>}
+export default function Home() {
+  return (
+    <main className="hero">
+      <small>SANTÉ · MAROC</small>
+      <h1>
+        Trouvez votre médecin.
+        <br />
+        Prenez rendez-vous.
+      </h1>
+      <p>
+        Recherchez un praticien vérifié, consultez ses disponibilités, et partagez vos analyses
+        ou vos radios avec lui avant la consultation.
+      </p>
+      <a className="button" href="/search">Rechercher un médecin</a>
+      <a className="secondary spaced" href="/documents">Mes documents médicaux</a>
+    </main>
+  );
+}

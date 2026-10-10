@@ -17,14 +17,28 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
  * Supabase would provide; `supabase/schema.sql` is applied unchanged.
  */
 
-const SOCKET = process.env.PGHOST ?? "/var/tmp/tabibpg";
+/**
+ * Any PostgreSQL 16 with pgcrypto and btree_gist will do. Locally that tends
+ * to be a socket in a scratch directory; in CI it is the service container on
+ * localhost, which wants a password. Both are reached through the standard
+ * libpq environment variables.
+ */
+const HOST = process.env.PGHOST ?? "/var/tmp/tabibpg";
 const PORT = Number(process.env.PGPORT ?? 55432);
+const USER = process.env.PGUSER ?? "postgres";
+const PASSWORD = process.env.PGPASSWORD;
 const DB = "tabib_rls_test";
 
 const repoRoot = join(__dirname, "..", "..");
 
-function connect(database: string, user = "postgres") {
-  return new Client({ host: SOCKET, port: PORT, user, database });
+function connect(database: string) {
+  return new Client({
+    host: HOST,
+    port: PORT,
+    user: USER,
+    database,
+    ...(PASSWORD ? { password: PASSWORD } : {}),
+  });
 }
 
 /** A client acting as one signed-in user, subject to RLS. */

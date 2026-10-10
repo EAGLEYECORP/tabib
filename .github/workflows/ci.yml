@@ -1,14 +1,48 @@
 name: CI
-on: [push,pull_request]
+on: [push, pull_request]
+
 jobs:
- build:
-  runs-on: ubuntu-latest
-  steps:
-   - uses: actions/checkout@v4
-   - uses: actions/setup-node@v4
-     with: {node-version: 20}
-   - run: npm install
-   - run: npm run build
-     env:
-      NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder
+  build:
+    runs-on: ubuntu-latest
+
+    # The row-level security suite runs the real schema against a real
+    # PostgreSQL server. Those policies are the only thing standing between one
+    # patient's medical documents and another's, so CI has to actually execute
+    # them rather than type-check around them.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder
