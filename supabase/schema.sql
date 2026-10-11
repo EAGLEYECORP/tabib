@@ -478,3 +478,116 @@ drop policy if exists "patient appointments update" on public.appointments;
 create policy "patient appointments cancel" on public.appointments
   for update using (auth.uid() = patient_id)
   with check (auth.uid() = patient_id);
+
+-- ---------------------------------------------------------------------------
+-- Opening consulting hours
+--
+-- A practitioner thinks in wall-clock time: "Tuesday, nine to one". Turning
+-- that into an instant has to go through the time-zone database, because
+-- Morocco's offset is not constant -- the country keeps UTC+1 year-round but
+-- returns to UTC for the month of Ramadan. PostgreSQL's AT TIME ZONE does
+-- this correctly from tzdata, so the conversion lives here rather than in the
+-- browser, where it would need a date library and would be wrong for several
+-- weeks a year if anyone reached for a fixed +01:00.
+-- ---------------------------------------------------------------------------
+
+-- Two overlapping open blocks would offer the same minute twice and let a
+-- doctor be booked into both. The diary refuses to describe itself twice.
+alter table public.doctor_availability
+  add constraint no_overlapping_availability
+  exclude using gist (
+    doctor_id with =,
+    tstzrange(start_at, end_at, '[)') with &&
+  ) where (status = 'open');
+
+/**
+ * Opens blocks of consulting time.
+ *
+ * Takes absolute instants, not wall-clock times. Resolving "nine o'clock in
+ * Casablanca" to a moment belongs with the code that renders it back, and
+ * that is the application: PostgreSQL's AT TIME ZONE would consult the
+ * server's own copy of the time-zone database, which is not always current --
+ * some builds still carry an Africa/Casablanca fixed at UTC, missing both the
+ * permanent UTC+1 and the Ramadan return to UTC. Converting in two places
+ * against two copies risks a doctor's 09:00 being shown to a patient as
+ * 08:00, so the conversion happens once, in apps/web/lib/booking/wall-time.ts.
+ *
+ * Runs as the caller, so the insert policy decides whose diary this writes
+ * to: a doctor can only ever open their own. Blocks in the past, or
+ * overlapping something already open, are skipped rather than failing the
+ * request -- a practitioner repeating a Tuesday for two months should not
+ * lose the other seven weeks because one is already covered.
+ *
+ * @param p_blocks [{"start": "<ISO instant>", "end": "<ISO instant>"}, ...]
+ */
+create or replace function public.open_availability(
+  p_blocks jsonb,
+  p_slot_minutes integer default 30
+)
+returns setof public.doctor_availability
+language plpgsql
+volatile
+as $$
+declare
+  block jsonb;
+  block_start timestamptz;
+  block_end timestamptz;
+  created public.doctor_availability;
+begin
+  if auth.uid() is null then
+    raise exception 'Not signed in' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_slot_minutes is null or p_slot_minutes < 5 or p_slot_minutes > 240 then
+    raise exception 'A consultation lasts between 5 and 240 minutes'
+      using errcode = 'check_violation';
+  end if;
+
+  if p_blocks is null or jsonb_typeof(p_blocks) <> 'array' then
+    raise exception 'Expected a list of blocks' using errcode = 'check_violation';
+  end if;
+
+  for block in select * from jsonb_array_elements(p_blocks) loop
+    block_start := (block ->> 'start')::timestamptz;
+    block_end := (block ->> 'end')::timestamptz;
+
+    if block_start is null or block_end is null then
+      raise exception 'Each block needs a start and an end'
+        using errcode = 'check_violation';
+    end if;
+
+    if block_end <= block_start then
+      raise exception 'The block must end after it starts'
+        using errcode = 'check_violation';
+    end if;
+
+    if block_end - block_start < (p_slot_minutes || ' minutes')::interval then
+      raise exception 'The block is shorter than one consultation'
+        using errcode = 'check_violation';
+    end if;
+
+    -- Opening hours that have already passed help nobody.
+    if block_end <= now() then
+      continue;
+    end if;
+
+    -- An overlap is a week already covered, not a reason to abandon the rest.
+    begin
+      insert into public.doctor_availability
+        (doctor_id, start_at, end_at, slot_minutes, status)
+      values (auth.uid(), block_start, block_end, p_slot_minutes, 'open')
+      returning * into created;
+
+      return next created;
+    exception
+      when exclusion_violation then
+        continue;
+    end;
+  end loop;
+
+  return;
+end;
+$$;
+
+revoke all on function public.open_availability(jsonb, integer) from public;
+grant execute on function public.open_availability(jsonb, integer) to authenticated;

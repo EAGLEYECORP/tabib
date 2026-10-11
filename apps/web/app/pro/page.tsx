@@ -91,6 +91,10 @@ export default async function PractitionerPage() {
       <p className="muted">
         {profile.display_name} · {profile.specialty} · {profile.city}
       </p>
+      <p className="row">
+        <a className="secondary" href="/pro/disponibilites">Mes disponibilités</a>
+        <a className="secondary" href={`/doctors/${profile.id}`}>Mon profil public</a>
+      </p>
 
       <section className="section">
         <h2>

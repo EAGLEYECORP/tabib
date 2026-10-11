@@ -8,3 +8,6 @@ playwright-report
 # test artifacts
 test-results
 .vitest
+
+# typescript incremental build cache
+*.tsbuildinfo

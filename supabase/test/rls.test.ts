@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "pg";
+import { weeklyBlocks } from "../../apps/web/lib/booking/wall-time";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 /**
@@ -824,6 +825,323 @@ describe("booking a slot", () => {
       [appointment.id],
     ));
     expect(rows[0].status).toBe("cancelled");
+  });
+});
+
+describe("opening consulting hours", () => {
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_availability");
+  });
+
+  /**
+   * Calls open_availability the way the screen does: the wall-clock times a
+   * practitioner typed, already resolved to instants by the application, so
+   * the zone conversion is exercised by the tests in
+   * apps/web/lib/booking/wall-time.test.ts rather than here.
+   */
+  function open(
+    caller: AsUser,
+    options: {
+      date: string;
+      start: string;
+      end: string;
+      slotMinutes?: number;
+      repeatWeeks?: number;
+    },
+  ) {
+    const blocks = weeklyBlocks({
+      date: options.date,
+      start: options.start,
+      end: options.end,
+      weeks: options.repeatWeeks ?? 1,
+    }).map((block) => ({ start: block.start.toISOString(), end: block.end.toISOString() }));
+
+    return caller.query<{ id: string; start_at: Date; end_at: Date; slot_minutes: number }>(
+      "select * from public.open_availability($1::jsonb, $2)",
+      [JSON.stringify(blocks), options.slotMinutes ?? 30],
+    );
+  }
+
+  /** A date far enough ahead that "in the past" never interferes. */
+  function soon(daysAhead = 7): string {
+    const date = new Date(Date.now() + daysAhead * 86_400_000);
+    return date.toISOString().slice(0, 10);
+  }
+
+  it("opens a block the patient can then book into", async () => {
+    const created = await open(asDoctorA, { date: soon(), start: "09:00", end: "13:00" });
+    expect(created).toHaveLength(1);
+
+    const slots = await asPatientA.query(
+      "select * from public.available_slots($1, now(), 30)",
+      [ids.doctorA],
+    );
+    expect(slots).toHaveLength(8);
+  });
+
+  it("stores exactly the instants it was given", async () => {
+    // The wall-clock conversion is the application's job and is tested there;
+    // what matters here is that nothing is reinterpreted on the way in. That
+    // separation is deliberate: this server's own time-zone data is stale,
+    // and letting the database resolve "09:00" would silently disagree with
+    // what the interface displays.
+    const [block] = weeklyBlocks({
+      date: "2027-07-13",
+      start: "09:00",
+      end: "13:00",
+      weeks: 1,
+    });
+    const [created] = await asDoctorA.query<{ start_at: Date; end_at: Date }>(
+      "select * from public.open_availability($1::jsonb, 30)",
+      [JSON.stringify([{ start: block.start.toISOString(), end: block.end.toISOString() }])],
+    );
+    expect(created.start_at.toISOString()).toBe(block.start.toISOString());
+    expect(created.end_at.toISOString()).toBe(block.end.toISOString());
+  });
+
+  it("repeats a weekly pattern", async () => {
+    const created = await open(asDoctorA, {
+      date: soon(),
+      start: "09:00",
+      end: "12:00",
+      repeatWeeks: 4,
+    });
+    expect(created).toHaveLength(4);
+
+    // Each one lands exactly a week after the last.
+    const starts = created.map((b) => b.start_at.getTime()).sort((a, b) => a - b);
+    for (let i = 1; i < starts.length; i += 1) {
+      expect(starts[i] - starts[i - 1]).toBe(7 * 86_400_000);
+    }
+  });
+
+  it("keeps the consultation length the practitioner chose", async () => {
+    const [block] = await open(asDoctorA, {
+      date: soon(),
+      start: "09:00",
+      end: "10:00",
+      slotMinutes: 15,
+    });
+    expect(block.slot_minutes).toBe(15);
+
+    const slots = await asPatientA.query(
+      "select * from public.available_slots($1, now(), 30)",
+      [ids.doctorA],
+    );
+    expect(slots).toHaveLength(4);
+  });
+
+  it("skips weeks already covered instead of failing the whole request", async () => {
+    const date = soon();
+    await open(asDoctorA, { date, start: "09:00", end: "12:00" });
+
+    // Repeating from the same day: the first week clashes, the rest do not.
+    const created = await open(asDoctorA, { date, start: "09:00", end: "12:00", repeatWeeks: 3 });
+    expect(created).toHaveLength(2);
+
+    const { rows } = await admin.query("select id from public.doctor_availability");
+    expect(rows).toHaveLength(3);
+  });
+
+  it("refuses a block overlapping one already open", async () => {
+    const date = soon();
+    await open(asDoctorA, { date, start: "09:00", end: "13:00" });
+    // 11:00-15:00 straddles the existing morning.
+    expect(await open(asDoctorA, { date, start: "11:00", end: "15:00" })).toHaveLength(0);
+  });
+
+  it("allows a second block that merely touches the first", async () => {
+    const date = soon();
+    await open(asDoctorA, { date, start: "09:00", end: "13:00" });
+    // An afternoon starting exactly when the morning ends is not an overlap.
+    expect(await open(asDoctorA, { date, start: "13:00", end: "18:00" })).toHaveLength(1);
+  });
+
+  it("lets two doctors hold the same hours", async () => {
+    const date = soon();
+    await open(asDoctorA, { date, start: "09:00", end: "13:00" });
+    expect(await open(asDoctorB, { date, start: "09:00", end: "13:00" })).toHaveLength(1);
+  });
+
+  it("skips a date that has already passed", async () => {
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    expect(await open(asDoctorA, { date: yesterday, start: "09:00", end: "13:00" })).toHaveLength(0);
+  });
+
+  it("reads an end before the start as an overnight block", async () => {
+    // A night clinic running 22:00 to 02:00 is a real thing, so the
+    // application resolves the end to the following day rather than refusing.
+    const [block] = await open(asDoctorA, { date: soon(), start: "22:00", end: "02:00" });
+    expect(block.end_at.getTime()).toBeGreaterThan(block.start_at.getTime());
+  });
+
+  it("refuses an inverted block submitted directly", async () => {
+    // The application never produces one, but the database is the last word.
+    const start = new Date(Date.now() + 86_400_000).toISOString();
+    const end = new Date(Date.now() + 3_600_000).toISOString();
+    await expect(
+      asDoctorA.query("select * from public.open_availability($1::jsonb, 30)", [
+        JSON.stringify([{ start, end }]),
+      ]),
+    ).rejects.toThrow(/end after it starts/i);
+  });
+
+  it("refuses a block shorter than one consultation", async () => {
+    await expect(
+      open(asDoctorA, { date: soon(), start: "09:00", end: "09:20", slotMinutes: 30 }),
+    ).rejects.toThrow(/shorter than one consultation/i);
+  });
+
+  it("refuses an implausible consultation length", async () => {
+    await expect(
+      open(asDoctorA, { date: soon(), start: "09:00", end: "17:00", slotMinutes: 1 }),
+    ).rejects.toThrow(/between 5 and 240/i);
+  });
+
+  it("refuses anything that is not a list of blocks", async () => {
+    await expect(
+      asDoctorA.query("select * from public.open_availability($1::jsonb, 30)", ['{"start":"x"}']),
+    ).rejects.toThrow(/list of blocks/i);
+  });
+
+  it("writes into the caller's own diary, never another doctor's", async () => {
+    // The function takes no doctor id at all: it uses the signed-in user, so
+    // there is nothing to tamper with.
+    await open(asDoctorA, { date: soon(), start: "09:00", end: "13:00" });
+    const { rows } = await admin.query<{ doctor_id: string }>(
+      "select doctor_id from public.doctor_availability",
+    );
+    expect(rows.every((r) => r.doctor_id === ids.doctorA)).toBe(true);
+  });
+
+  it("refuses a patient opening consulting hours", async () => {
+    // A patient has no doctor_profiles row, so the foreign key stops them even
+    // before the policy would.
+    await expect(
+      open(asPatientA, { date: soon(), start: "09:00", end: "13:00" }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("closing consulting hours", () => {
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_availability");
+  });
+
+  async function openBlock(doctorId: string): Promise<string> {
+    const {
+      rows: [row],
+    } = await admin.query<{ id: string }>(
+      `insert into public.doctor_availability (doctor_id, start_at, end_at, slot_minutes)
+       values ($1, date_trunc('minute', now()) + interval '24 hours',
+               date_trunc('minute', now()) + interval '28 hours', 30)
+       returning id`,
+      [doctorId],
+    );
+    return row.id;
+  }
+
+  it("takes the slots off the board", async () => {
+    const id = await openBlock(ids.doctorA);
+    expect(
+      await asPatientA.query("select * from public.available_slots($1, now(), 30)", [ids.doctorA]),
+    ).toHaveLength(8);
+
+    await asDoctorA.query("delete from public.doctor_availability where id = $1", [id]);
+    expect(
+      await asPatientA.query("select * from public.available_slots($1, now(), 30)", [ids.doctorA]),
+    ).toHaveLength(0);
+  });
+
+  it("leaves appointments already booked standing", async () => {
+    // Withdrawing opening hours must not quietly cancel people who already
+    // have a place in the diary.
+    const id = await openBlock(ids.doctorA);
+    const [slot] = await asPatientA.query<{ slot_start: Date; slot_end: Date }>(
+      "select * from public.available_slots($1, now(), 30)",
+      [ids.doctorA],
+    );
+    await admin.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2, $3, $4, 'confirmed')`,
+      [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+    );
+
+    await asDoctorA.query("delete from public.doctor_availability where id = $1", [id]);
+
+    const { rows } = await admin.query("select id from public.appointments");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("refuses to let one doctor close another's hours", async () => {
+    const id = await openBlock(ids.doctorA);
+    await asDoctorB.query("delete from public.doctor_availability where id = $1", [id]);
+    const { rows } = await admin.query("select id from public.doctor_availability where id = $1", [
+      id,
+    ]);
+    expect(rows).toHaveLength(1);
+  });
+});
+
+describe("the whole loop", () => {
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_availability");
+  });
+
+  it("a doctor opens hours, a patient books, the slot goes", async () => {
+    const date = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
+    const blocks = weeklyBlocks({ date, start: "09:00", end: "11:00", weeks: 1 }).map((b) => ({
+      start: b.start.toISOString(),
+      end: b.end.toISOString(),
+    }));
+
+    // The practitioner opens a morning.
+    const opened = await asDoctorA.query(
+      "select * from public.open_availability($1::jsonb, 30)",
+      [JSON.stringify(blocks)],
+    );
+    expect(opened).toHaveLength(1);
+
+    // The patient sees four half-hour consultations.
+    const offered = await asPatientA.query<{ slot_start: Date; slot_end: Date }>(
+      "select * from public.available_slots($1, now(), 30)",
+      [ids.doctorA],
+    );
+    expect(offered).toHaveLength(4);
+
+    // They take the second one.
+    const chosen = offered[1];
+    await asPatientA.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, reason)
+       values ($1, $2, $3, $4, 'Contrôle')`,
+      [ids.patientA, ids.doctorA, chosen.slot_start, chosen.slot_end],
+    );
+
+    // It is gone for everyone else, and the rest remain.
+    const afterwards = await asPatientB.query<{ slot_start: Date }>(
+      "select * from public.available_slots($1, now(), 30)",
+      [ids.doctorA],
+    );
+    expect(afterwards).toHaveLength(3);
+    expect(afterwards.map((s) => s.slot_start.getTime())).not.toContain(
+      chosen.slot_start.getTime(),
+    );
+
+    // The doctor sees the booking in their own diary.
+    const diary = await asDoctorA.query("select id from public.appointments");
+    expect(diary).toHaveLength(1);
+
+    // And the patient can cancel, which puts the slot straight back.
+    await asPatientA.query(
+      "update public.appointments set status = 'cancelled' where patient_id = $1",
+      [ids.patientA],
+    );
+    expect(
+      await asPatientB.query("select * from public.available_slots($1, now(), 30)", [ids.doctorA]),
+    ).toHaveLength(4);
   });
 });
 

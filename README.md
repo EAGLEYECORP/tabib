@@ -6,6 +6,9 @@ Next.js + Supabase + Vercel.
 ## What works today
 
 - **Search** verified practitioners by specialty and city.
+- **Opening hours**: a practitioner opens blocks of consulting time — a date,
+  start and end, how long one consultation lasts, optionally repeated weekly —
+  and those become bookable slots on their public profile.
 - **Booking**: a patient opens a practitioner's profile, sees free slots
   grouped by day, picks one and confirms. Overlapping bookings are impossible
   because the database says so (a GiST exclusion constraint), not because the
@@ -62,11 +65,32 @@ Three things had to be fixed before any of this could work:
   chosen time. It now requires the slot to fall inside an advertised block and
   to respect the lead time.
 
+### One clock, not two
+
 Slots are shown in the cabinet's time zone, not the viewer's, so a patient
 booking from Paris sees the hour they are expected in Casablanca. The zone is
 resolved through the IANA database rather than a fixed `+01:00`: Morocco sits
 on UTC+1 year-round but returns to UTC for the month of Ramadan, so a
-hard-coded offset would show the wrong hour for several weeks a year.
+hard-coded offset is wrong for several weeks a year.
+
+A practitioner types wall-clock time — "Tuesday, nine to one" — and that is
+resolved to an instant in `apps/web/lib/booking/wall-time.ts`, **not** by
+PostgreSQL's `AT TIME ZONE`. The reason is worth knowing before anyone
+"simplifies" it: every time a patient or doctor *reads* a time, it is
+formatted by `Intl`, using the runtime's copy of the time-zone database. If
+writing consulted the database server's copy instead, the two could disagree
+and a doctor's 09:00 would be shown to a patient as 08:00. That gap is not
+hypothetical — the PostgreSQL this was developed against reports
+`Africa/Casablanca` as a flat UTC+0 for every date, missing both the
+permanent UTC+1 and the Ramadan return. Converting in one place means the two
+ends can only ever be wrong together, which is a far smaller problem than
+being wrong separately.
+
+`open_availability()` therefore takes absolute instants and never
+reinterprets them. Weekly repeats are converted per week from their own
+wall-clock time rather than by adding seven days, because across the Ramadan
+change those are not the same thing: the clock moves, "nine o'clock" does
+not.
 
 ## How document access is decided
 
@@ -107,7 +131,7 @@ consultation is not rewritten.
 ## Tests
 
 ```bash
-npm test          # 119 tests
+npm test          # 159 tests
 npm run typecheck
 npm run build
 ```
@@ -122,8 +146,8 @@ The suite has two halves:
   Supabase provides, including `auth.uid()` reading the JWT subject from the
   session.
 - **Application logic**: upload inspection, filename sanitisation, phone
-  normalisation, slot grouping and time-zone handling, and the upload route's
-  sequencing.
+  normalisation, wall-clock-to-instant conversion across Morocco's Ramadan
+  change, slot grouping, and the upload route's sequencing.
 
 The RLS half needs a PostgreSQL 16 with `pgcrypto` and `btree_gist`, reached
 through the usual `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` variables.
@@ -136,6 +160,7 @@ have. Without one, those tests fail to connect — they do not silently skip.
 supabase/schema.sql          Tables, RLS policies, Storage bucket, audit trigger
 supabase/test/               The policies, run against real PostgreSQL
 apps/web/app/                Pages and API routes
+apps/web/lib/booking/        Slot presentation and wall-clock conversion
 apps/web/lib/documents/      Upload inspection and document vocabulary
 apps/web/lib/morocco/        Phone numbers in E.164
 apps/web/components/         Uploader and document list
@@ -143,10 +168,12 @@ apps/web/components/         Uploader and document list
 
 ## Not done yet
 
-- **Practitioners cannot open their own availability from the UI.** The table,
-  the policies and the slot function are there, and a doctor may write their
-  own rows, but the screen to manage opening hours is not built — blocks have
-  to be inserted directly for now.
+- **No recurrence model.** Repeating a weekly pattern writes concrete blocks,
+  so changing "every Tuesday" means removing and reopening them. Fine for a
+  season's hours; it would not scale to a cabinet planning a year.
+- **No holidays or one-off closures.** A practitioner withdraws a block to
+  close a day, which also means there is no way to close an afternoon inside
+  an open morning without splitting it.
 - **Arabic.** The interface is French only. The document and appointment data
   carry nothing language-specific, so this is a presentation change, but it is
   a real gap in this market.
