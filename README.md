@@ -6,6 +6,10 @@ Next.js + Supabase + Vercel.
 ## What works today
 
 - **Search** verified practitioners by specialty and city.
+- **Closures**: a holiday, Aïd, a conference or a lost afternoon hides the
+  slots it covers without deleting the weekly hours underneath — and hands
+  back the patients already booked inside it, with their numbers, because
+  those appointments survive the closure and those people need telling.
 - **Opening hours**: a practitioner opens blocks of consulting time — a date,
   start and end, how long one consultation lasts, optionally repeated weekly —
   and those become bookable slots on their public profile.
@@ -99,6 +103,14 @@ cannot hand one patient's scans to another:
 
 - A document **belongs to a patient**, always — including a prescription a
   doctor writes, which is the patient's record held on their behalf.
+Closures work the same way, and carry a trap worth knowing about: the check
+that stops a patient booking into a closed period cannot be a plain subquery
+in the policy. Closures are private to the practitioner, so a subquery
+evaluated as the *patient* sees no rows and concludes nothing is closed —
+passing exactly the bookings it exists to refuse. It goes through
+`is_doctor_closed()`, which runs as its owner and returns a bare boolean: the
+patient learns a time is unavailable, never why.
+
 - A doctor sees a document **only through an appointment of their own**.
   Attaching a document to an appointment is what shares it; detaching is what
   stops sharing. There is no separate permission list to drift out of step
@@ -131,9 +143,17 @@ consultation is not rewritten.
 ## Tests
 
 ```bash
-npm test          # 159 tests
+npm test          # 174 tests
 npm run typecheck
 npm run build
+```
+
+The row-level security half needs a PostgreSQL to run against.
+`supabase/test/start-postgres.sh` brings up a throwaway one if you do not
+already have a server to point `PGHOST`/`PGPORT` at:
+
+```bash
+source supabase/test/start-postgres.sh && npm test
 ```
 
 The suite has two halves:
@@ -151,8 +171,8 @@ The suite has two halves:
 
 The RLS half needs a PostgreSQL 16 with `pgcrypto` and `btree_gist`, reached
 through the usual `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` variables.
-CI starts one as a service container; locally, point them at any instance you
-have. Without one, those tests fail to connect — they do not silently skip.
+CI starts one as a service container. Without one, those tests fail to
+connect — they do not silently skip.
 
 ## Layout
 
@@ -171,9 +191,12 @@ apps/web/components/         Uploader and document list
 - **No recurrence model.** Repeating a weekly pattern writes concrete blocks,
   so changing "every Tuesday" means removing and reopening them. Fine for a
   season's hours; it would not scale to a cabinet planning a year.
-- **No holidays or one-off closures.** A practitioner withdraws a block to
-  close a day, which also means there is no way to close an afternoon inside
-  an open morning without splitting it.
+- **Closures do not notify anyone.** The practitioner is shown who is affected
+  and is expected to call them. Nothing is sent automatically, because nothing
+  is sent automatically anywhere yet — see SMS below.
+- **No SMS.** No booking confirmation, no reminder the day before, no notice
+  when a closure affects someone. For a market where no-shows are the problem
+  a booking platform exists to solve, this is the largest remaining gap.
 - **Arabic.** The interface is French only. The document and appointment data
   carry nothing language-specific, so this is a presentation change, but it is
   a real gap in this market.

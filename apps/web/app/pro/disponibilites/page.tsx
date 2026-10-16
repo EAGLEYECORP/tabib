@@ -1,7 +1,14 @@
 import { createClient } from "../../../lib/supabase/server";
 import { AvailabilityForm } from "../../../components/availability-form";
-import { closeAvailability } from "./actions";
-import { dayLabel, formatTime, localDate, MOROCCO_TIME_ZONE } from "../../../lib/booking/slots";
+import { closeAvailability, reopenPeriod } from "./actions";
+import { ClosureForm } from "../../../components/closure-form";
+import {
+  dayLabel,
+  formatDayLong,
+  formatTime,
+  localDate,
+  MOROCCO_TIME_ZONE,
+} from "../../../lib/booking/slots";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Mes disponibilités · Tabib.ma", robots: { index: false } };
@@ -50,7 +57,7 @@ export default async function AvailabilityPage() {
 
   const now = new Date();
 
-  const [{ data: blocks }, { data: appointments }] = await Promise.all([
+  const [{ data: blocks }, { data: appointments }, { data: closures }] = await Promise.all([
     supabase
       .from("doctor_availability")
       .select("id,start_at,end_at,slot_minutes,status")
@@ -61,6 +68,11 @@ export default async function AvailabilityPage() {
       .select("id,start_at")
       .gte("start_at", now.toISOString())
       .in("status", ["requested", "confirmed"]),
+    supabase
+      .from("doctor_absences")
+      .select("id,starts_at,ends_at,reason")
+      .gte("ends_at", now.toISOString())
+      .order("starts_at", { ascending: true }),
   ]);
 
   type Block = {
@@ -163,6 +175,58 @@ export default async function AvailabilityPage() {
                 </li>
               );
             })}
+          </ul>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Fermer une période</h2>
+        <p className="muted">
+          Congé, conférence, Aïd : masquez vos créneaux sans supprimer vos horaires habituels.
+        </p>
+        <ClosureForm today={todayLocal} />
+      </section>
+
+      <section className="section">
+        <h2>Fermetures à venir</h2>
+        {(closures ?? []).length === 0 ? (
+          <div className="card empty">
+            <p className="muted">Aucune fermeture prévue.</p>
+          </div>
+        ) : (
+          <ul className="documents">
+            {((closures ?? []) as {
+              id: string;
+              starts_at: string;
+              ends_at: string;
+              reason: string | null;
+            }[]).map((closure) => (
+              <li key={closure.id} className="card">
+                <div className="doc-head">
+                  <div>
+                    <strong>
+                      {formatDayLong(new Date(closure.starts_at))}
+                      {localDate(new Date(closure.starts_at), MOROCCO_TIME_ZONE) !==
+                        localDate(new Date(closure.ends_at), MOROCCO_TIME_ZONE) &&
+                        ` → ${formatDayLong(new Date(closure.ends_at))}`}
+                    </strong>
+                    <p className="muted">
+                      {formatTime(new Date(closure.starts_at))} –{" "}
+                      {formatTime(new Date(closure.ends_at))}
+                    </p>
+                    {closure.reason && <p className="muted">{closure.reason}</p>}
+                  </div>
+                  <div className="doc-actions">
+                    <form action={reopenPeriod}>
+                      <input type="hidden" name="closureId" value={closure.id} />
+                      <button type="submit" className="secondary">
+                        Rouvrir
+                      </button>
+                    </form>
+                  </div>
+                </div>
+              </li>
+            ))}
           </ul>
         )}
       </section>

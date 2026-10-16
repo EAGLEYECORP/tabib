@@ -87,6 +87,9 @@ const ids = {
   apptB: "",
 };
 
+/** Gives each fixture account its own number, as a real sign-up has. */
+let phoneCounter = 1000;
+
 let asPatientA: AsUser;
 let asPatientB: AsUser;
 let asDoctorA: AsUser;
@@ -137,8 +140,10 @@ beforeEach(async () => {
     const {
       rows: [user],
     } = await admin.query<{ id: string }>(
-      "insert into auth.users (raw_user_meta_data) values (jsonb_build_object('full_name', $1::text)) returning id",
-      [name],
+      `insert into auth.users (phone, raw_user_meta_data)
+       values ($2, jsonb_build_object('full_name', $1::text))
+       returning id`,
+      [name, `+21260000${String(phoneCounter++).padStart(4, "0")}`],
     );
     await admin.query(
       "update public.profiles set role = $2::public.user_role where id = $1",
@@ -1142,6 +1147,225 @@ describe("the whole loop", () => {
     expect(
       await asPatientB.query("select * from public.available_slots($1, now(), 30)", [ids.doctorA]),
     ).toHaveLength(4);
+  });
+});
+
+describe("closing time off", () => {
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_availability");
+    await admin.query("delete from public.doctor_absences");
+  });
+
+  /** Opens a four-hour block a week out, in whole minutes. */
+  async function openMorning(doctorId = ids.doctorA): Promise<void> {
+    await admin.query(
+      `insert into public.doctor_availability (doctor_id, start_at, end_at, slot_minutes)
+       values ($1, date_trunc('hour', now()) + interval '7 days',
+               date_trunc('hour', now()) + interval '7 days' + interval '4 hours', 30)`,
+      [doctorId],
+    );
+  }
+
+  /** Closes a period relative to the start of that block. */
+  function close(
+    caller: AsUser,
+    options: { fromHours: number; toHours: number; reason?: string },
+  ) {
+    return caller.query(
+      `insert into public.doctor_absences (doctor_id, starts_at, ends_at, reason)
+       values ($1,
+               date_trunc('hour', now()) + interval '7 days' + ($2 || ' hours')::interval,
+               date_trunc('hour', now()) + interval '7 days' + ($3 || ' hours')::interval,
+               $4)
+       returning id`,
+      [ids.doctorA, options.fromHours, options.toHours, options.reason ?? null],
+    );
+  }
+
+  const slotsFor = (caller: AsUser, doctorId = ids.doctorA) =>
+    caller.query<{ slot_start: Date; slot_end: Date }>(
+      "select * from public.available_slots($1, now(), 30)",
+      [doctorId],
+    );
+
+  it("hides the slots it covers without touching the hours underneath", async () => {
+    await openMorning();
+    expect(await slotsFor(asPatientA)).toHaveLength(8);
+
+    // Close the first two hours only.
+    await close(asDoctorA, { fromHours: 0, toHours: 2, reason: "Conférence" });
+    expect(await slotsFor(asPatientA)).toHaveLength(4);
+
+    // The availability block itself survives, which is the whole point: the
+    // practitioner gets their Tuesday back when the closure passes.
+    const { rows } = await admin.query("select id from public.doctor_availability");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("closes a whole day when the period covers it", async () => {
+    await openMorning();
+    await close(asDoctorA, { fromHours: -1, toHours: 6, reason: "Aïd" });
+    expect(await slotsFor(asPatientA)).toHaveLength(0);
+  });
+
+  it("hides a slot it only partly covers", async () => {
+    await openMorning();
+    // Straddling the 60-minute boundary touches the slots either side of it,
+    // and a slot only partly closed is still unbookable.
+    await close(asDoctorA, { fromHours: 0.75, toHours: 1.25 });
+    expect(await slotsFor(asPatientA)).toHaveLength(6);
+  });
+
+  it("gives the time back when the closure is lifted", async () => {
+    await openMorning();
+    const [closure] = await close(asDoctorA, { fromHours: 0, toHours: 4 });
+    expect(await slotsFor(asPatientA)).toHaveLength(0);
+
+    await asDoctorA.query("delete from public.doctor_absences where id = $1", [
+      (closure as { id: string }).id,
+    ]);
+    expect(await slotsFor(asPatientA)).toHaveLength(8);
+  });
+
+  it("only affects the practitioner who declared it", async () => {
+    await openMorning(ids.doctorA);
+    await openMorning(ids.doctorB);
+    await close(asDoctorA, { fromHours: 0, toHours: 4 });
+
+    expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(0);
+    expect(await slotsFor(asPatientA, ids.doctorB)).toHaveLength(8);
+  });
+
+  it("refuses a booking inside it, even from a stale page", async () => {
+    await openMorning();
+    const [slot] = await slotsFor(asPatientA);
+
+    await close(asDoctorA, { fromHours: 0, toHours: 4 });
+
+    // The patient still holds the slot they saw a moment ago.
+    await expect(
+      asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4)`,
+        [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+      ),
+    ).rejects.toThrow(/row-level security/i);
+  });
+
+  it("leaves appointments already booked standing", async () => {
+    // Closing a day must not silently cancel people who have a place in the
+    // diary. They keep it; the practitioner is expected to call them.
+    await openMorning();
+    const [slot] = await slotsFor(asPatientA);
+    await asPatientA.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+       values ($1, $2, $3, $4)`,
+      [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+    );
+
+    await close(asDoctorA, { fromHours: 0, toHours: 4 });
+
+    const { rows } = await admin.query<{ status: string }>(
+      "select status from public.appointments",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("requested");
+    // And the patient still sees it.
+    expect(await asPatientA.query("select id from public.appointments")).toHaveLength(1);
+  });
+
+  it("refuses a period that ends before it starts", async () => {
+    await expect(close(asDoctorA, { fromHours: 4, toHours: 1 })).rejects.toThrow(
+      /check constraint|violates/i,
+    );
+  });
+
+  it("is private to the practitioner", async () => {
+    await openMorning();
+    await close(asDoctorA, { fromHours: 0, toHours: 4, reason: "Raison médicale" });
+
+    // A patient sees the slots vanish but never learns why.
+    expect(await asPatientA.query("select id from public.doctor_absences")).toHaveLength(0);
+    // Nor does another practitioner.
+    expect(await asDoctorB.query("select id from public.doctor_absences")).toHaveLength(0);
+    // The owner does.
+    expect(await asDoctorA.query("select reason from public.doctor_absences")).toHaveLength(1);
+  });
+
+  it("cannot be declared on another practitioner's diary", async () => {
+    await expect(
+      asDoctorB.query(
+        `insert into public.doctor_absences (doctor_id, starts_at, ends_at)
+         values ($1, now() + interval '8 days', now() + interval '9 days')`,
+        [ids.doctorA],
+      ),
+    ).rejects.toThrow(/row-level security/i);
+  });
+
+  it("cannot be lifted by another practitioner", async () => {
+    await openMorning();
+    const [closure] = await close(asDoctorA, { fromHours: 0, toHours: 4 });
+    await asDoctorB.query("delete from public.doctor_absences where id = $1", [
+      (closure as { id: string }).id,
+    ]);
+    expect(await asDoctorA.query("select id from public.doctor_absences")).toHaveLength(1);
+  });
+});
+
+describe("who a closure would affect", () => {
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_availability");
+    await admin.query("delete from public.doctor_absences");
+  });
+
+  async function bookOne(patientId: string, hoursAhead: number): Promise<void> {
+    await admin.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2, date_trunc('hour', now()) + ($3 || ' hours')::interval,
+               date_trunc('hour', now()) + ($3 || ' hours')::interval + interval '30 minutes',
+               'confirmed')`,
+      [patientId, ids.doctorA, hoursAhead],
+    );
+  }
+
+  const affected = (caller: AsUser, fromHours: number, toHours: number) =>
+    caller.query<{ patient_name: string; patient_phone: string; start_at: Date }>(
+      `select * from public.appointments_in_period(
+         date_trunc('hour', now()) + ($1 || ' hours')::interval,
+         date_trunc('hour', now()) + ($2 || ' hours')::interval)`,
+      [fromHours, toHours],
+    );
+
+  it("names the patients who would need telling", async () => {
+    // A practitioner marking a holiday needs to know who is already booked,
+    // because those bookings survive the closure.
+    await bookOne(ids.patientA, 24);
+    await bookOne(ids.patientB, 25);
+    await bookOne(ids.patientA, 200); // well outside the period
+
+    const rows = await affected(asDoctorA, 23, 26);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.patient_name).sort()).toEqual(["Karim Tazi", "Salma Bennis"]);
+    // With a number to call.
+    expect(rows[0].patient_phone).toBeTruthy();
+  });
+
+  it("returns nothing when the period is clear", async () => {
+    await bookOne(ids.patientA, 200);
+    expect(await affected(asDoctorA, 23, 26)).toHaveLength(0);
+  });
+
+  it("shows only the caller's own diary", async () => {
+    await bookOne(ids.patientA, 24);
+    expect(await affected(asDoctorB, 23, 26)).toHaveLength(0);
+  });
+
+  it("ignores appointments already cancelled", async () => {
+    await bookOne(ids.patientA, 24);
+    await admin.query("update public.appointments set status = 'cancelled'");
+    expect(await affected(asDoctorA, 23, 26)).toHaveLength(0);
   });
 });
 

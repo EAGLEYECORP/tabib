@@ -47,3 +47,8 @@ form.card{display:grid;gap:12px}
 .slot:hover{background:#172033;color:#fff;border-color:#172033}
 .struck{text-decoration:line-through}
 .muted-card{opacity:.72}
+.notice.warn{background:#fffaeb;color:#b54708;border:1px solid #fedf89}
+.affected{margin:9px 0 0;padding-left:19px}
+.affected li{margin-bottom:4px}
+label.inline{display:flex;align-items:center;gap:9px;font-weight:500}
+label.inline input{width:auto}

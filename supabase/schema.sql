@@ -591,3 +591,186 @@ $$;
 
 revoke all on function public.open_availability(jsonb, integer) from public;
 grant execute on function public.open_availability(jsonb, integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Closures
+--
+-- Opening hours repeat; life does not. A practitioner takes a holiday, closes
+-- for Aïd, goes to a conference, or loses an afternoon to an emergency, and
+-- none of that should mean deleting the weekly blocks they will want back
+-- next month. A closure sits over the top of the diary and hides whatever it
+-- covers, so the underlying hours survive it.
+--
+-- A closure hides *free* time. It deliberately does not cancel appointments
+-- already booked: those people have a place in the diary and are owed a
+-- conversation, not a silent disappearance. The screen lists who is affected
+-- so the practitioner can reach them.
+-- ---------------------------------------------------------------------------
+
+create table public.doctor_absences(
+  id uuid primary key default gen_random_uuid(),
+  doctor_id uuid not null references public.doctor_profiles(id) on delete cascade,
+  starts_at timestamptz not null,
+  ends_at timestamptz not null,
+  reason text check (reason is null or length(reason) <= 200),
+  created_at timestamptz not null default now(),
+  check (ends_at > starts_at)
+);
+
+create index doctor_absences_doctor_idx
+  on public.doctor_absences (doctor_id, starts_at);
+
+alter table public.doctor_absences enable row level security;
+
+-- Only the practitioner sees or touches their own closures. Patients never
+-- need to read them: a closed slot is simply absent from what is offered,
+-- which says nothing about why.
+create policy "doctor manages own closures" on public.doctor_absences
+  for all using (auth.uid() = doctor_id) with check (auth.uid() = doctor_id);
+
+-- Closures take effect by being excluded from the slots on offer. The
+-- function already runs as its owner, so it reads them regardless of the
+-- policy above.
+create or replace function public.available_slots(
+  p_doctor_id uuid,
+  p_from timestamptz default now(),
+  p_days integer default 14
+)
+returns table (slot_start timestamptz, slot_end timestamptz)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with bounds as (
+    select
+      greatest(p_from, now() + public.booking_lead_time()) as earliest,
+      p_from + (least(greatest(p_days, 0), 60) || ' days')::interval as latest
+  ),
+  candidate as (
+    -- Each availability block is cut into consultations of its own length.
+    -- The series stops one slot short of the end so a block never emits a
+    -- consultation that would run past closing time.
+    select
+      step as slot_start,
+      step + (av.slot_minutes || ' minutes')::interval as slot_end
+    from public.doctor_availability av
+    cross join bounds b
+    cross join lateral generate_series(
+      av.start_at,
+      av.end_at - (av.slot_minutes || ' minutes')::interval,
+      (av.slot_minutes || ' minutes')::interval
+    ) as step
+    where av.doctor_id = p_doctor_id
+      and av.status = 'open'
+      and av.end_at > b.earliest
+      and av.start_at < b.latest
+  )
+  select c.slot_start, c.slot_end
+  from candidate c
+  cross join bounds b
+  where c.slot_start >= b.earliest
+    and c.slot_start < b.latest
+    and not exists (
+      select 1
+      from public.appointments a
+      where a.doctor_id = p_doctor_id
+        and a.status in ('requested', 'confirmed')
+        and tstzrange(a.start_at, a.end_at, '[)')
+            && tstzrange(c.slot_start, c.slot_end, '[)')
+    )
+    and not exists (
+      select 1
+      from public.doctor_absences x
+      where x.doctor_id = p_doctor_id
+        and tstzrange(x.starts_at, x.ends_at, '[)')
+            && tstzrange(c.slot_start, c.slot_end, '[)')
+    )
+  order by c.slot_start;
+$$;
+
+/**
+ * Whether a practitioner has closed a given period.
+ *
+ * This has to run as its owner. Closures are private to the practitioner, so
+ * a policy subquery evaluated as the *patient* would see no rows at all and
+ * conclude that nothing is closed -- the check would pass for exactly the
+ * bookings it exists to refuse. Returning a bare boolean leaks nothing: the
+ * patient learns a time is unavailable, never why.
+ */
+create or replace function public.is_doctor_closed(
+  p_doctor_id uuid,
+  p_starts_at timestamptz,
+  p_ends_at timestamptz
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.doctor_absences x
+    where x.doctor_id = p_doctor_id
+      and tstzrange(x.starts_at, x.ends_at, '[)')
+          && tstzrange(p_starts_at, p_ends_at, '[)')
+  );
+$$;
+
+grant execute on function public.is_doctor_closed(uuid, timestamptz, timestamptz)
+  to anon, authenticated;
+
+-- Booking has to respect a closure too, or a patient holding a stale page
+-- could still post a time the practitioner has just closed.
+drop policy if exists "patient appointments create" on public.appointments;
+
+create policy "patient appointments create" on public.appointments
+  for insert with check (
+    auth.uid() = patient_id
+    and start_at >= now() + public.booking_lead_time()
+    and exists (
+      select 1 from public.doctor_availability av
+      where av.doctor_id = appointments.doctor_id
+        and av.status = 'open'
+        and appointments.start_at >= av.start_at
+        and appointments.end_at <= av.end_at
+    )
+    and not public.is_doctor_closed(
+      appointments.doctor_id, appointments.start_at, appointments.end_at
+    )
+  );
+
+/**
+ * The appointments a proposed closure would cover.
+ *
+ * A practitioner marking a holiday needs to know who is already booked into
+ * it before they commit, because those bookings survive the closure and the
+ * people behind them need telling. Returns only the caller's own diary.
+ */
+create or replace function public.appointments_in_period(
+  p_starts_at timestamptz,
+  p_ends_at timestamptz
+)
+returns table (
+  appointment_id uuid,
+  start_at timestamptz,
+  patient_name text,
+  patient_phone text
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select a.id, a.start_at, p.full_name, p.phone
+  from public.appointments a
+  join public.profiles p on p.id = a.patient_id
+  where a.doctor_id = auth.uid()
+    and a.status in ('requested', 'confirmed')
+    and tstzrange(a.start_at, a.end_at, '[)')
+        && tstzrange(p_starts_at, p_ends_at, '[)')
+  order by a.start_at;
+$$;
+
+grant execute on function public.appointments_in_period(timestamptz, timestamptz) to authenticated;
