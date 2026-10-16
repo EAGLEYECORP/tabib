@@ -3,6 +3,13 @@ import { createClient } from "../../../lib/supabase/server";
 import { cancelAppointment } from "../../doctors/[id]/reserver/actions";
 import { DocumentUploader } from "../../../components/document-uploader";
 import { formatDayLong, formatTime } from "../../../lib/booking/slots";
+import {
+  canPatientCancel,
+  isAppointmentStatus,
+  isClosed,
+  statusLabel,
+  statusTone,
+} from "../../../lib/booking/status";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Mon rendez-vous · Tabib.ma", robots: { index: false } };
@@ -53,8 +60,13 @@ export default async function AppointmentPage({
   }).doctor_profiles;
 
   const start = new Date(appointment.start_at);
-  const cancelled = appointment.status === "cancelled";
-  const past = start.getTime() < Date.now();
+  const status = isAppointmentStatus(appointment.status) ? appointment.status : "requested";
+  const cancelled = status === "cancelled";
+  const settled = isClosed(status);
+  // The same rule the database enforces: a patient may withdraw up to the
+  // minute the consultation starts, and not afterwards. Offering the button
+  // outside that window would only produce a refusal.
+  const cancellable = canPatientCancel(status, start);
 
   return (
     <main className="container narrow">
@@ -72,23 +84,47 @@ export default async function AppointmentPage({
           {doctor?.specialty}
           {doctor?.city ? ` · ${doctor.city}` : ""}
         </p>
-        <p className={cancelled ? "muted struck" : "time"}>
+        <p className={settled ? "muted struck" : "time"}>
           {formatDayLong(start)} à {formatTime(start)}
         </p>
         {appointment.reason && <p className="muted">{appointment.reason}</p>}
         <p className="chips">
-          <span className={cancelled ? "chip" : "chip success"}>{appointment.status}</span>
+          <span className={`chip ${statusTone(status) === "neutral" ? "" : statusTone(status)}`}>
+            {statusLabel(status, "patient")}
+          </span>
         </p>
 
-        {!cancelled && !past && (
+        {status === "requested" && (
+          <p className="muted">
+            Le praticien doit encore confirmer ce rendez-vous. Présentez-vous à l&apos;heure
+            prévue sauf avis contraire du cabinet.
+          </p>
+        )}
+        {status === "no_show" && (
+          <p className="muted">
+            Le cabinet a noté que vous ne vous êtes pas présenté. Contactez-le si c&apos;est une
+            erreur.
+          </p>
+        )}
+
+        {cancellable ? (
           <form action={cancelAppointment}>
             <input type="hidden" name="appointmentId" value={appointment.id} />
             <button type="submit" className="danger-button">Annuler ce rendez-vous</button>
+            <small className="muted">
+              Annulez dès que vous le savez : le créneau repart aussitôt à un autre patient.
+            </small>
           </form>
+        ) : (
+          !settled && (
+            <p className="muted">
+              Ce rendez-vous a déjà commencé : pour l&apos;annuler, appelez le cabinet.
+            </p>
+          )
         )}
       </section>
 
-      {!cancelled && (
+      {!settled && (
         <section className="card section">
           <h2>Joindre un document</h2>
           <p className="muted">

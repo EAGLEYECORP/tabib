@@ -1477,3 +1477,375 @@ describe("the audit trail", () => {
     expect(rows[0].actor_id).toBe(ids.patientA);
   });
 });
+
+describe("the life of an appointment", () => {
+  /**
+   * Creates one appointment and returns its id. `hoursAhead` may be negative
+   * for a consultation that has already begun, which is how the attendance
+   * rules get exercised.
+   */
+  async function seedAppointment(options: {
+    patientId: string;
+    doctorId: string;
+    hoursAhead: number;
+    status?: string;
+  }): Promise<string> {
+    const {
+      rows: [row],
+    } = await admin.query<{ id: string }>(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at, status)
+       values ($1, $2,
+               date_trunc('minute', now()) + ($3 || ' hours')::interval,
+               date_trunc('minute', now()) + ($3 || ' hours')::interval + interval '30 minutes',
+               $4::public.appointment_status)
+       returning id`,
+      [options.patientId, options.doctorId, options.hoursAhead, options.status ?? "requested"],
+    );
+    return row.id;
+  }
+
+  function statusOf(id: string) {
+    return admin
+      .query<{ status: string }>("select status from public.appointments where id = $1", [id])
+      .then((r) => r.rows[0].status);
+  }
+
+  beforeEach(async () => {
+    await admin.query("delete from public.appointments");
+  });
+
+  describe("the practitioner's decision", () => {
+    it("confirms a request", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      expect(await statusOf(id)).toBe("confirmed");
+    });
+
+    it("refuses a request, which frees the slot again", async () => {
+      await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+      const [slot] = await slotsFor(asPatientA, ids.doctorA);
+      const {
+        rows: [row],
+      } = await admin.query<{ id: string }>(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4) returning id`,
+        [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+      );
+      expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(1);
+
+      await asDoctorA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        row.id,
+      ]);
+      expect(await slotsFor(asPatientA, ids.doctorA)).toHaveLength(2);
+    });
+
+    it("marks a consultation that has happened as effectuée", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: -1,
+        status: "confirmed",
+      });
+      await asDoctorA.query("update public.appointments set status = 'completed' where id = $1", [
+        id,
+      ]);
+      expect(await statusOf(id)).toBe("completed");
+    });
+
+    it("cannot mark tomorrow's patient absent", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+        status: "confirmed",
+      });
+      await expect(
+        asDoctorA.query("update public.appointments set status = 'no_show' where id = $1", [id]),
+      ).rejects.toThrow(/before it starts/i);
+      expect(await statusOf(id)).toBe("confirmed");
+    });
+
+    it("cannot put an answered request back to undecided", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+        status: "confirmed",
+      });
+      await expect(
+        asDoctorA.query("update public.appointments set status = 'requested' where id = $1", [id]),
+      ).rejects.toThrow(/returned to requested/i);
+    });
+
+    it("cannot touch another practitioner's diary", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      // The policy matches no row, so this is a silent no-op rather than an
+      // error — which is the right answer: doctor B learns nothing.
+      await asDoctorB.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      expect(await statusOf(id)).toBe("requested");
+    });
+  });
+
+  describe("what a practitioner may not rewrite", () => {
+    it("cannot move the appointment to another time", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await expect(
+        asDoctorA.query(
+          "update public.appointments set start_at = start_at + interval '3 hours' where id = $1",
+          [id],
+        ),
+      ).rejects.toThrow(/cannot be changed/i);
+    });
+
+    it("cannot hand the slot to a different patient", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await expect(
+        asDoctorA.query("update public.appointments set patient_id = $2 where id = $1", [
+          id,
+          ids.patientB,
+        ]),
+      ).rejects.toThrow(/cannot be changed/i);
+    });
+
+    it("cannot reword why the patient says they are coming", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await expect(
+        asDoctorA.query("update public.appointments set reason = 'rien de grave' where id = $1", [
+          id,
+        ]),
+      ).rejects.toThrow(/only the patient/i);
+    });
+  });
+
+  describe("what a patient may not rewrite", () => {
+    it("cannot move a legal booking to three in the morning", async () => {
+      // The whole point of the guard: the insert policy checks the time, and
+      // an UPDATE never passes the insert policy.
+      await openAvailability({ doctorId: ids.doctorA, startsInHours: 24, lengthHours: 1 });
+      const [slot] = await slotsFor(asPatientA, ids.doctorA);
+      await asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4)`,
+        [ids.patientA, ids.doctorA, slot.slot_start, slot.slot_end],
+      );
+
+      await expect(
+        asPatientA.query(
+          `update public.appointments
+             set start_at = start_at - interval '7 hours',
+                 end_at = end_at - interval '7 hours'
+           where patient_id = $1`,
+          [ids.patientA],
+        ),
+      ).rejects.toThrow(/cannot be changed/i);
+    });
+
+    it("cannot hand their appointment to another practitioner", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await expect(
+        asPatientA.query("update public.appointments set doctor_id = $2 where id = $1", [
+          id,
+          ids.doctorB,
+        ]),
+      ).rejects.toThrow(/cannot be changed/i);
+    });
+
+    it("cannot confirm their own booking", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await expect(
+        asPatientA.query("update public.appointments set status = 'confirmed' where id = $1", [id]),
+      ).rejects.toThrow(/only cancel/i);
+      expect(await statusOf(id)).toBe("requested");
+    });
+
+    it("cannot record their own attendance", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: -1,
+        status: "confirmed",
+      });
+      await expect(
+        asPatientA.query("update public.appointments set status = 'completed' where id = $1", [id]),
+      ).rejects.toThrow(/only cancel/i);
+    });
+
+    it("may still edit the reason for their visit", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await asPatientA.query(
+        "update public.appointments set reason = 'douleur au genou' where id = $1",
+        [id],
+      );
+      const { rows } = await admin.query<{ reason: string }>(
+        "select reason from public.appointments where id = $1",
+        [id],
+      );
+      expect(rows[0].reason).toBe("douleur au genou");
+    });
+  });
+
+  describe("cancelling", () => {
+    it("is allowed up to the minute the consultation starts", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 0.02, // about a minute away
+        status: "confirmed",
+      });
+      await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+      expect(await statusOf(id)).toBe("cancelled");
+    });
+
+    it("is not how a patient erases a consultation they missed", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: -2,
+        status: "confirmed",
+      });
+      await expect(
+        asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [id]),
+      ).rejects.toThrow(/already started/i);
+    });
+  });
+
+  describe("an outcome, once recorded,", () => {
+    it("cannot be reopened by the practitioner", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: -2,
+        status: "no_show",
+      });
+      await expect(
+        asDoctorA.query("update public.appointments set status = 'completed' where id = $1", [id]),
+      ).rejects.toThrow(/closed/i);
+    });
+
+    it("cannot be revived by the patient who cancelled it", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+        status: "cancelled",
+      });
+      await expect(
+        asPatientA.query("update public.appointments set status = 'confirmed' where id = $1", [id]),
+      ).rejects.toThrow(/closed/i);
+    });
+
+    it("survives the same decision being submitted twice", async () => {
+      // A double-clicked button, or a page left open and submitted again.
+      // Writing the status it already has changes nothing and must not read
+      // as a failure.
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+        status: "cancelled",
+      });
+      await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+      expect(await statusOf(id)).toBe("cancelled");
+    });
+  });
+
+  describe("the audit trail", () => {
+    it("records who cancelled, and what it was before", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+        status: "confirmed",
+      });
+      await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+
+      const { rows } = await admin.query<{
+        actor_id: string;
+        action: string;
+        metadata: { from: string; to: string; by: string };
+      }>(
+        "select actor_id, action, metadata from public.audit_logs where entity_id = $1",
+        [id],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].actor_id).toBe(ids.patientA);
+      expect(rows[0].action).toBe("appointment.cancelled");
+      expect(rows[0].metadata.from).toBe("confirmed");
+      expect(rows[0].metadata.by).toBe("patient");
+    });
+
+    it("says when it was the practitioner", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      const { rows } = await admin.query<{ metadata: { by: string } }>(
+        "select metadata from public.audit_logs where entity_id = $1",
+        [id],
+      );
+      expect(rows[0].metadata.by).toBe("doctor");
+    });
+
+    it("does not log an edit that changed no outcome", async () => {
+      const id = await seedAppointment({
+        patientId: ids.patientA,
+        doctorId: ids.doctorA,
+        hoursAhead: 24,
+      });
+      await asPatientA.query("update public.appointments set reason = 'contrôle' where id = $1", [
+        id,
+      ]);
+      expect(
+        await admin
+          .query("select 1 from public.audit_logs where entity_id = $1", [id])
+          .then((r) => r.rows),
+      ).toHaveLength(0);
+    });
+  });
+});

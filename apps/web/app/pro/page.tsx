@@ -1,4 +1,11 @@
 import { createClient } from "../../lib/supabase/server";
+import {
+  isAppointmentStatus,
+  isClosed,
+  statusLabel,
+  statusTone,
+  type AppointmentStatus,
+} from "../../lib/booking/status";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Espace praticien · Tabib.ma", robots: { index: false } };
@@ -60,7 +67,6 @@ export default async function PractitionerPage() {
     .select("id,start_at,end_at,status,reason,patient_id,profiles!appointments_patient_id_fkey(full_name,phone)")
     .gte("start_at", startOfDay.toISOString())
     .lt("start_at", endOfDay.toISOString())
-    .in("status", ["requested", "confirmed"])
     .order("start_at", { ascending: true });
 
   type Row = {
@@ -70,7 +76,17 @@ export default async function PractitionerPage() {
     reason: string | null;
     profiles: { full_name: string | null; phone: string | null } | null;
   };
-  const today = (appointments ?? []) as unknown as Row[];
+  // The whole day, including the consultations already seen. Hiding those
+  // once they are marked done would make a practitioner's own record of the
+  // morning disappear as they worked through it.
+  const today = ((appointments ?? []) as unknown as Row[]).map((row) => ({
+    ...row,
+    appointmentStatus: (isAppointmentStatus(row.status)
+      ? row.status
+      : "requested") as AppointmentStatus,
+  }));
+  const expected = today.filter((row) => !isClosed(row.appointmentStatus));
+  const toConfirm = today.filter((row) => row.appointmentStatus === "requested");
 
   // One query for the documents shared across today's consultations, rather
   // than one per row.
@@ -107,16 +123,21 @@ export default async function PractitionerPage() {
         <p className="muted">
           {today.length === 0
             ? "Aucun rendez-vous aujourd'hui."
-            : today.length === 1
-              ? "1 consultation"
-              : `${today.length} consultations`}
+            : expected.length === 1
+              ? "1 consultation attendue"
+              : `${expected.length} consultations attendues`}
+          {toConfirm.length > 0 &&
+            ` · ${toConfirm.length} à confirmer`}
         </p>
 
         <ul className="documents">
           {today.map((appointment) => {
             const shared = counts.get(appointment.id) ?? 0;
             return (
-              <li key={appointment.id} className="card">
+              <li
+                key={appointment.id}
+                className={isClosed(appointment.appointmentStatus) ? "card settled" : "card"}
+              >
                 <div className="doc-head">
                   <div>
                     <strong className="time">
@@ -133,7 +154,15 @@ export default async function PractitionerPage() {
                     )}
                     {appointment.reason && <p className="muted">{appointment.reason}</p>}
                     <p className="chips">
-                      <span className="chip">{appointment.status}</span>
+                      <span
+                        className={`chip ${
+                          statusTone(appointment.appointmentStatus) === "neutral"
+                            ? ""
+                            : statusTone(appointment.appointmentStatus)
+                        }`}
+                      >
+                        {statusLabel(appointment.appointmentStatus, "doctor")}
+                      </span>
                       {shared > 0 && (
                         <span className="chip success">
                           {shared === 1 ? "1 document" : `${shared} documents`}
@@ -142,8 +171,13 @@ export default async function PractitionerPage() {
                     </p>
                   </div>
                   <div className="doc-actions">
-                    <a className="secondary" href={`/pro/consultation/${appointment.id}`}>
-                      Ouvrir
+                    <a
+                      className={
+                        appointment.appointmentStatus === "requested" ? "button" : "secondary"
+                      }
+                      href={`/pro/consultation/${appointment.id}`}
+                    >
+                      {appointment.appointmentStatus === "requested" ? "Répondre" : "Ouvrir"}
                     </a>
                   </div>
                 </div>

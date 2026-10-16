@@ -85,7 +85,16 @@ export async function bookSlot(
   redirect(`/appointments/${data.id}?nouveau=1`);
 }
 
-/** Cancelling frees the slot immediately: available_slots ignores it at once. */
+/**
+ * Cancelling frees the slot immediately: available_slots ignores it at once.
+ *
+ * The database refuses this once the consultation has started, or once it
+ * already has an outcome — see `guard_appointment_update`. The refusal is not
+ * turned into a message here because the only way to reach it is a page left
+ * open: the redirect re-renders it with the real status and the line that
+ * explains what to do instead, which is more use than an error about a button
+ * that should no longer have been there.
+ */
 export async function cancelAppointment(formData: FormData): Promise<void> {
   const appointmentId = String(formData.get("appointmentId") ?? "");
   if (!appointmentId) return;

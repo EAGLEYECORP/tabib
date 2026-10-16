@@ -52,3 +52,11 @@ form.card{display:grid;gap:12px}
 .affected li{margin-bottom:4px}
 label.inline{display:flex;align-items:center;gap:9px;font-weight:500}
 label.inline input{width:auto}
+.chip.pending{background:#fff6ed;color:#b54708}
+.chip.danger{background:#fef3f2;color:#b42318}
+.card.settled{opacity:.6}
+.decision{display:grid;gap:14px}
+.decision-row{display:flex;flex-direction:column;align-items:flex-start;gap:5px}
+.decision-row.confirming{background:#fef3f2;border:1px solid #fecdca;border-radius:12px;padding:14px;gap:9px;width:100%}
+.decision-row.confirming p{margin:0}
+.decision form,.card form{display:grid;gap:6px;justify-items:start}

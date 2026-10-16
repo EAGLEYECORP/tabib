@@ -18,6 +18,10 @@ Next.js + Supabase + Vercel.
   because the database says so (a GiST exclusion constraint), not because the
   application checked first and hoped — when two patients submit the same slot
   at the same moment, exactly one wins and the other is told to pick again.
+- **Answering a booking**: a practitioner confirms or refuses a request, and
+  afterwards records whether the patient came. The patient sees "en attente de
+  confirmation" rather than a request that sits unanswered forever, and can
+  withdraw right up to the minute it starts.
 - **Medical documents**: a patient uploads analyses, radiology images or
   insurance forms, shares them with a practitioner by attaching them to an
   appointment, and withdraws the share at any time. A practitioner sends a
@@ -96,6 +100,51 @@ wall-clock time rather than by adding seven days, because across the Ramadan
 change those are not the same thing: the clock moves, "nine o'clock" does
 not.
 
+## The life of an appointment
+
+Every booking arrives as `requested` and the practitioner answers it:
+confirmed, or refused. Once the consultation has begun they record what
+happened — effectuée, or the patient did not come. Those three are endings: an
+appointment past one of them is a record, and a record that can still be
+rewritten is not worth keeping.
+
+Giving the two sides that power meant first taking away power they already
+had. "A party to this appointment may update their own row" sounds like a rule
+and is not one — it says who may write, never what they may write. A patient
+could post a booking that satisfied every insert check, inside an open block
+and past the lead time, and then `UPDATE start_at` to three in the morning,
+because an UPDATE never passes the insert policy. The same policy would have
+accepted a new `doctor_id`, moving the appointment into a practitioner's diary
+without their having advertised the time at all. The practitioner's own was
+wider still: it would have taken a new `patient_id`.
+
+**A policy cannot express the fix.** A policy sees one row at a time: `USING`
+is given the old row, `WITH CHECK` the new one, and neither can compare them.
+"These columns may not change" needs both at once, so it is a `BEFORE UPDATE`
+trigger — `guard_appointment_update`. Who, when and for how long are settled
+when the appointment is made; changing one means cancelling and booking again,
+which sends the new time back through the insert policy instead of around it.
+
+The rest of the trigger is about who may say what. A patient may withdraw and
+only withdraw — whether they turned up is the practitioner's observation, not
+the patient's claim, and a patient cannot cancel a consultation that has
+already started to tidy away a missed one. A practitioner cannot mark tomorrow
+morning's patient absent, because absence is an observation and not a
+prediction. And the reason for the visit stays the patient's own words: a
+practitioner records their findings in a document, not by editing what the
+patient said.
+
+Status changes land in `audit_logs` alongside the document trail, with whether
+it was the patient, the practitioner or the system that made them. "Who
+cancelled my appointment?" is the same kind of question as "who saw my file?"
+and deserves the same answer.
+
+`apps/web/lib/booking/status.ts` holds the matching view of those rules, so
+the interface never offers a button the database is going to refuse — an
+action that fails is worse than one that was never offered. It is also where
+the English the enum is written in becomes the French a cabinet reads; showing
+`no_show` to a practitioner is a bug, not a detail.
+
 ## How document access is decided
 
 Every rule lives in the database, so a mistake in a page or an API route
@@ -143,7 +192,7 @@ consultation is not rewritten.
 ## Tests
 
 ```bash
-npm test          # 174 tests
+npm test          # 211 tests
 npm run typecheck
 npm run build
 ```
@@ -180,7 +229,7 @@ connect — they do not silently skip.
 supabase/schema.sql          Tables, RLS policies, Storage bucket, audit trigger
 supabase/test/               The policies, run against real PostgreSQL
 apps/web/app/                Pages and API routes
-apps/web/lib/booking/        Slot presentation and wall-clock conversion
+apps/web/lib/booking/        Slots, wall-clock conversion, appointment status
 apps/web/lib/documents/      Upload inspection and document vocabulary
 apps/web/lib/morocco/        Phone numbers in E.164
 apps/web/components/         Uploader and document list
@@ -194,7 +243,8 @@ apps/web/components/         Uploader and document list
 - **Closures do not notify anyone.** The practitioner is shown who is affected
   and is expected to call them. Nothing is sent automatically, because nothing
   is sent automatically anywhere yet — see SMS below.
-- **No SMS.** No booking confirmation, no reminder the day before, no notice
+- **No SMS.** A confirmed or refused booking changes what the patient sees on
+  the site and nothing more: no message, no reminder the day before, no notice
   when a closure affects someone. For a market where no-shows are the problem
   a booking platform exists to solve, this is the largest remaining gap.
 - **Arabic.** The interface is French only. The document and appointment data

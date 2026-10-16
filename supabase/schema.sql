@@ -774,3 +774,178 @@ as $$
 $$;
 
 grant execute on function public.appointments_in_period(timestamptz, timestamptz) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- The life of an appointment
+--
+-- Every booking arrives as 'requested' and, until now, stayed there: nothing
+-- in the schema or the interface ever moved it. A patient saw "requested"
+-- for a consultation they had already attended, and a practitioner had no way
+-- to say "yes, come" — the one thing a cabinet does with a booking request.
+--
+-- Giving the two sides that power meant first taking away power they already
+-- had. "A party to this appointment may update their own row" sounds like a
+-- rule and is not one: it says who may write, never what they may write. A
+-- patient could post a booking that satisfied every insert check — inside an
+-- open block, outside a closure, past the lead time — and then UPDATE
+-- start_at to three in the morning, or hand the row to a different
+-- practitioner, because an UPDATE never passes the insert policy. The
+-- practitioner's own policy was wider still: it would have accepted a new
+-- patient_id.
+--
+-- A policy cannot express the fix, because a policy sees one row at a time —
+-- USING is given the old row, WITH CHECK the new one, and neither can compare
+-- them. "These columns may not change" needs both at once, which is a trigger.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.guard_appointment_update()
+returns trigger
+language plpgsql
+as $$
+declare
+  actor uuid := auth.uid();
+begin
+  -- Nothing below constrains the service role or a migration. Row-level
+  -- security does not constrain them either, so a check here would be
+  -- comfort rather than safety — and a caller the policies let through
+  -- always has a subject, because every policy on this table compares
+  -- auth.uid() to a column.
+  if actor is null then
+    return new;
+  end if;
+
+  -- Who, when, and for how long are settled when the appointment is made.
+  -- Changing one means cancelling and booking again, so the new time goes
+  -- through the insert policy instead of around it.
+  if new.id <> old.id
+     or new.patient_id <> old.patient_id
+     or new.doctor_id <> old.doctor_id
+     or new.start_at <> old.start_at
+     or new.end_at <> old.end_at
+     or new.created_at <> old.created_at
+  then
+    raise exception
+      'an appointment''s time and parties cannot be changed; cancel and book again'
+      using errcode = 'check_violation';
+  end if;
+
+  -- The reason for the visit is the patient's own account of why they are
+  -- coming. A practitioner records their findings in a document, not by
+  -- editing what the patient said.
+  if coalesce(new.reason, '') <> coalesce(old.reason, '')
+     and actor <> old.patient_id
+  then
+    raise exception 'only the patient may change the reason for a visit'
+      using errcode = 'check_violation';
+  end if;
+
+  if new.status = old.status then
+    return new;
+  end if;
+
+  -- Cancelled, attended and missed are endings. After one of them the row is
+  -- a record of what happened, and a record that can still be rewritten is
+  -- not worth keeping.
+  if old.status in ('cancelled', 'completed', 'no_show') then
+    raise exception 'this appointment is closed and its outcome cannot change'
+      using errcode = 'check_violation';
+  end if;
+
+  if actor = old.patient_id then
+    -- A patient may withdraw, and only withdraw: whether they turned up is
+    -- the practitioner's observation, not the patient's claim.
+    if new.status <> 'cancelled' then
+      raise exception 'a patient may only cancel an appointment'
+        using errcode = 'check_violation';
+    end if;
+    -- Cancelling is allowed up to the minute it starts — a late cancellation
+    -- is still far better for the cabinet than silence. Afterwards it is
+    -- something that happened, and only the practitioner can say what.
+    if old.start_at <= now() then
+      raise exception 'this appointment has already started and cannot be cancelled'
+        using errcode = 'check_violation';
+    end if;
+
+  elsif actor = old.doctor_id then
+    -- 'requested' is what a booking arrives as; a practitioner cannot put one
+    -- back to undecided once they have answered it.
+    if new.status = 'requested' then
+      raise exception 'an appointment cannot be returned to requested'
+        using errcode = 'check_violation';
+    end if;
+    -- Attendance is an observation about a consultation that has begun, not a
+    -- prediction: tomorrow's patient has not failed to arrive yet.
+    if new.status in ('completed', 'no_show') and old.start_at > now() then
+      raise exception
+        'an appointment cannot be completed or marked missed before it starts'
+        using errcode = 'check_violation';
+    end if;
+
+  else
+    raise exception 'not a party to this appointment'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger guard_appointment_update
+  before update on public.appointments
+  for each row execute function public.guard_appointment_update();
+
+-- The policies still decide who may write at all; they are restated here with
+-- an explicit WITH CHECK so the intent is on the page rather than inherited
+-- from USING, and so the pair reads as "a party, and only to their own row".
+drop policy if exists "patient appointments update" on public.appointments;
+drop policy if exists "patient appointments cancel" on public.appointments;
+drop policy if exists "doctor appointments update" on public.appointments;
+
+create policy "patient appointments cancel" on public.appointments
+  for update using (auth.uid() = patient_id)
+  with check (auth.uid() = patient_id);
+
+create policy "doctor appointments decide" on public.appointments
+  for update using (auth.uid() = doctor_id)
+  with check (auth.uid() = doctor_id);
+
+-- "Who cancelled my appointment, and when?" is the same kind of question as
+-- "who saw my file?", and deserves the same answer. Only outcomes are logged;
+-- a reason reworded by the patient is not an event anyone will ask about.
+create or replace function public.log_appointment_status_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.status is distinct from old.status then
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (
+      auth.uid(),
+      'appointment.' || new.status,
+      'appointment',
+      new.id,
+      jsonb_build_object(
+        'from', old.status,
+        'to', new.status,
+        'doctor_id', new.doctor_id,
+        'patient_id', new.patient_id,
+        'start_at', new.start_at,
+        -- Whether the actor was the patient, the practitioner or neither is
+        -- the first thing anyone reading this back wants to know.
+        'by', case
+                when auth.uid() = new.patient_id then 'patient'
+                when auth.uid() = new.doctor_id then 'doctor'
+                else 'system'
+              end
+      )
+    );
+  end if;
+  return new;
+end;
+$$;
+
+create or replace trigger appointments_status_audit
+  after update on public.appointments
+  for each row execute function public.log_appointment_status_change();

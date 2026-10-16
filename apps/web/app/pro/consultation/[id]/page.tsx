@@ -3,6 +3,9 @@ import { createClient } from "../../../../lib/supabase/server";
 import { DocumentUploader } from "../../../../components/document-uploader";
 import { DocumentList, type DocumentListItem } from "../../../../components/document-list";
 import type { DocumentKind } from "../../../../lib/documents/kinds";
+import { AppointmentDecision } from "../../../../components/appointment-decision";
+import { isAppointmentStatus, statusLabel, statusTone } from "../../../../lib/booking/status";
+import { formatDayLong, formatTime } from "../../../../lib/booking/slots";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Consultation · Tabib.ma", robots: { index: false } };
@@ -54,6 +57,12 @@ export default async function ConsultationPage({
     profiles: { full_name: string | null; phone: string | null } | null;
   }).profiles;
 
+  const start = new Date(appointment.start_at);
+  // An unrecognised status would be a schema change this page has not caught
+  // up with; treating it as a fresh request is the reading that offers the
+  // practitioner the most to do about it.
+  const status = isAppointmentStatus(appointment.status) ? appointment.status : "requested";
+
   const { data: documents } = await supabase
     .from("documents")
     .select(
@@ -77,11 +86,25 @@ export default async function ConsultationPage({
 
       <h1>{patient?.full_name ?? "Patient"}</h1>
       <p className="muted">
-        {new Date(appointment.start_at).toLocaleString("fr-FR")} ·{" "}
-        {appointment.status}
-        {patient?.phone ? ` · ${patient.phone}` : ""}
+        {formatDayLong(start)} à {formatTime(start)}
+        {patient?.phone ? " · " : ""}
+        {patient?.phone && <a href={`tel:${patient.phone}`}>{patient.phone}</a>}
+      </p>
+      <p className="chips">
+        <span className={`chip ${statusTone(status) === "neutral" ? "" : statusTone(status)}`}>
+          {statusLabel(status, "doctor")}
+        </span>
       </p>
       {appointment.reason && <p>{appointment.reason}</p>}
+
+      <section className="card section">
+        <h2>Ce rendez-vous</h2>
+        <AppointmentDecision
+          appointmentId={appointment.id}
+          status={status}
+          startAt={appointment.start_at}
+        />
+      </section>
 
       <section className="section">
         <h2>Documents du patient</h2>
