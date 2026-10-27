@@ -41,18 +41,23 @@ export default async function PractitionerPage() {
 
   const { data: profile } = await supabase
     .from("doctor_profiles")
-    .select("id,display_name,specialty,city")
+    .select("id,display_name,specialty,city,verified")
     .eq("id", user.id)
     .maybeSingle();
 
+  // This used to be a dead end — "contactez Tabib.ma" — which was the whole
+  // of practitioner onboarding. Registering is something someone can now do.
   if (!profile) {
     return (
-      <main className="container">
+      <main className="container narrow">
         <h1>Espace praticien</h1>
-        <p className="notice danger">
-          Ce compte n&apos;est pas rattaché à un profil praticien. Contactez Tabib.ma si vous
-          pensez qu&apos;il s&apos;agit d&apos;une erreur.
+        <p>
+          Ce compte n&apos;a pas encore de profil praticien. Créez-le pour ouvrir vos
+          disponibilités et recevoir des rendez-vous.
         </p>
+        <a className="button" href="/pro/inscription">
+          Créer mon profil praticien
+        </a>
       </main>
     );
   }
@@ -107,9 +112,20 @@ export default async function PractitionerPage() {
       <p className="muted">
         {profile.display_name} · {profile.specialty} · {profile.city}
       </p>
+      {!profile.verified && (
+        <p className="notice warn">
+          <strong>Profil en cours de vérification.</strong> Vous n&apos;apparaissez pas encore
+          dans la recherche et ne pouvez pas recevoir de rendez-vous. Vos disponibilités sont
+          conservées et deviendront réservables dès la vérification.
+        </p>
+      )}
+
       <p className="row">
         <a className="secondary" href="/pro/disponibilites">Mes disponibilités</a>
-        <a className="secondary" href={`/doctors/${profile.id}`}>Mon profil public</a>
+        <a className="secondary" href="/pro/inscription">Mes informations</a>
+        {profile.verified && (
+          <a className="secondary" href={`/doctors/${profile.id}`}>Mon profil public</a>
+        )}
       </p>
 
       <section className="section">

@@ -109,7 +109,7 @@ export function doctorActions(
       action: "confirm",
       status: "confirmed",
       label: "Confirmer",
-      hint: "Le patient voit son rendez-vous confirmé.",
+      hint: "Le patient reçoit un SMS de confirmation.",
       destructive: false,
     });
   }
@@ -133,7 +133,7 @@ export function doctorActions(
     action: "cancel",
     status: "cancelled",
     label: status === "requested" ? "Refuser" : "Annuler",
-    hint: "Prévenez le patient : rien ne lui est envoyé automatiquement.",
+    hint: "Le patient reçoit un SMS. Appelez-le si la raison demande une explication.",
     destructive: true,
   });
 

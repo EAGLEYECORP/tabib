@@ -55,14 +55,23 @@ class AsUser {
    * Runs a query as this user. The role is switched to `authenticated` and the
    * JWT subject set for the statement, which is what makes the policies apply
    * — as superuser they would all be bypassed and every test would pass.
+   *
+   * A visitor gets no subject at all, so `auth.uid()` is null exactly as it
+   * is for an unauthenticated Supabase request. Setting one anyway was
+   * quietly turning every `anon` test into a signed-in one, and it hid the
+   * fact that PostgreSQL grants EXECUTE on functions to PUBLIC: a visitor
+   * could call `register_practitioner` and the guard inside it had never been
+   * reached by a test.
    */
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
     await this.client.query("begin");
     try {
       await this.client.query(`set local role ${this.role}`);
-      await this.client.query("select set_config('request.jwt.claim.sub', $1, true)", [
-        this.userId,
-      ]);
+      if (this.role === "authenticated") {
+        await this.client.query("select set_config('request.jwt.claim.sub', $1, true)", [
+          this.userId,
+        ]);
+      }
       const result = await this.client.query(sql, params);
       await this.client.query("commit");
       return result.rows as T[];
@@ -107,15 +116,14 @@ beforeAll(async () => {
   await admin.query(readFileSync(join(repoRoot, "supabase", "test", "harness.sql"), "utf8"));
   await admin.query(readFileSync(join(repoRoot, "supabase", "schema.sql"), "utf8"));
 
-  // The application role must be able to reach the tables at all; RLS then
-  // decides which rows. Without the grants every test would fail for the
-  // wrong reason.
+  // The table grants are part of schema.sql now, so the suite exercises them
+  // rather than quietly papering over their absence — applying the schema to
+  // anything but a Supabase project used to leave every query refused.
+  // Storage is still granted here, because on a real project Supabase owns
+  // that schema and these objects are the harness's imitation of it.
   await admin.query(`
-    grant select, insert, update, delete on all tables in schema public to authenticated;
-    grant select on all tables in schema public to anon;
     grant select, insert, update, delete on storage.objects to authenticated;
     grant select on storage.buckets to authenticated;
-    grant usage, select on all sequences in schema public to authenticated;
   `);
 
   session = connect(DB);
@@ -1846,6 +1854,642 @@ describe("the life of an appointment", () => {
           .query("select 1 from public.audit_logs where entity_id = $1", [id])
           .then((r) => r.rows),
       ).toHaveLength(0);
+    });
+  });
+});
+
+describe("becoming a practitioner", () => {
+  /** A signed-in account with no practitioner profile of any kind. */
+  let newcomer: string;
+  let asNewcomer: AsUser;
+
+  beforeEach(async () => {
+    const {
+      rows: [user],
+    } = await admin.query<{ id: string }>(
+      `insert into auth.users (phone, raw_user_meta_data)
+       values ($1, jsonb_build_object('full_name', 'Dr Nadia Chraibi'))
+       returning id`,
+      [`+21260000${String(phoneCounter++).padStart(4, "0")}`],
+    );
+    newcomer = user.id;
+    asNewcomer = new AsUser(session, newcomer);
+  });
+
+  it("creates an unverified profile the practitioner can see", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+
+    // The bug this replaces: a practitioner could not read their own row
+    // until it was verified, so their own pages told them they had no
+    // profile.
+    const rows = await asNewcomer.query<{ display_name: string; verified: boolean }>(
+      "select display_name, verified from public.doctor_profiles where id = $1",
+      [newcomer],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].display_name).toBe("Dr Nadia Chraibi");
+    expect(rows[0].verified).toBe(false);
+  });
+
+  it("promotes the account from patient to practitioner", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    const { rows } = await admin.query<{ role: string }>(
+      "select role from public.profiles where id = $1",
+      [newcomer],
+    );
+    expect(rows[0].role).toBe("doctor");
+  });
+
+  it("stays out of everyone else's sight until verified", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    expect(
+      await asPatientA.query("select id from public.doctor_profiles where id = $1", [newcomer]),
+    ).toHaveLength(0);
+    expect(
+      await asPatientA.query("select id from public.search_practitioners(null, null, null)"),
+    ).toHaveLength(2); // the two verified fixtures, not three
+  });
+
+  it("cannot be booked while unverified", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    // They may open hours straight away — the point is that the hours do not
+    // become bookable until someone has verified them.
+    await openAvailability({ doctorId: newcomer, startsInHours: 24, lengthHours: 1 });
+    const slots = await slotsFor(asPatientA, newcomer);
+    expect(slots.length).toBeGreaterThan(0);
+
+    await expect(
+      asPatientA.query(
+        `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+         values ($1, $2, $3, $4)`,
+        [ids.patientA, newcomer, slots[0].slot_start, slots[0].slot_end],
+      ),
+    ).rejects.toThrow(/row-level security|policy/i);
+  });
+
+  it("is bookable once an administrator verifies it", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    await admin.query("update public.doctor_profiles set verified = true where id = $1", [
+      newcomer,
+    ]);
+    await openAvailability({ doctorId: newcomer, startsInHours: 24, lengthHours: 1 });
+    const slots = await slotsFor(asPatientA, newcomer);
+
+    await asPatientA.query(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+       values ($1, $2, $3, $4)`,
+      [ids.patientA, newcomer, slots[0].slot_start, slots[0].slot_end],
+    );
+    expect(
+      await admin
+        .query("select 1 from public.appointments where doctor_id = $1", [newcomer])
+        .then((r) => r.rows),
+    ).toHaveLength(1);
+  });
+
+  it("cannot wave itself through", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    await expect(
+      asNewcomer.query("update public.doctor_profiles set verified = true where id = $1", [
+        newcomer,
+      ]),
+    ).rejects.toThrow(/cannot verify themselves/i);
+  });
+
+  it("cannot verify somebody else either", async () => {
+    await expect(
+      asNewcomer.query("update public.doctor_profiles set verified = true"),
+    ).resolves.toHaveLength(0);
+    const { rows } = await admin.query<{ verified: boolean }>(
+      "select verified from public.doctor_profiles where id = $1",
+      [ids.doctorA],
+    );
+    expect(rows[0].verified).toBe(true); // unchanged, and it was already true
+  });
+
+  it("keeps its verification when the practitioner edits their details", async () => {
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Oujda', null)",
+    );
+    await admin.query("update public.doctor_profiles set verified = true where id = $1", [
+      newcomer,
+    ]);
+
+    // Registering again is how a practitioner corrects their city. It must
+    // not quietly cost them their verification.
+    await asNewcomer.query(
+      "select public.register_practitioner('Dr Nadia Chraibi', 'Dermatologie', 'Nador', 'Tiers payant')",
+    );
+    const { rows } = await admin.query<{ city: string; bio: string; verified: boolean }>(
+      "select city, bio, verified from public.doctor_profiles where id = $1",
+      [newcomer],
+    );
+    expect(rows[0].city).toBe("Nador");
+    expect(rows[0].bio).toBe("Tiers payant");
+    expect(rows[0].verified).toBe(true);
+  });
+
+  it("refuses a registration with nothing in it", async () => {
+    await expect(
+      asNewcomer.query("select public.register_practitioner('  ', 'Dermatologie', 'Oujda', null)"),
+    ).rejects.toThrow(/needs a name/i);
+  });
+
+  it("cannot be done by a visitor who has not signed in", async () => {
+    const asVisitor = new AsUser(session, newcomer, "anon");
+    await expect(
+      asVisitor.query(
+        "select public.register_practitioner('Dr X', 'Dermatologie', 'Oujda', null)",
+      ),
+    ).rejects.toThrow(/permission denied|sign in/i);
+  });
+});
+
+describe("what an account may say about itself", () => {
+  it("may become a practitioner", async () => {
+    await asPatientA.query("update public.profiles set role = 'doctor' where id = $1", [
+      ids.patientA,
+    ]);
+    const { rows } = await admin.query<{ role: string }>(
+      "select role from public.profiles where id = $1",
+      [ids.patientA],
+    );
+    expect(rows[0].role).toBe("doctor");
+  });
+
+  it("may not make itself an administrator", async () => {
+    // Nothing grants anything on the strength of `role` today. This is about
+    // the first policy that does.
+    await expect(
+      asPatientA.query("update public.profiles set role = 'platform_admin' where id = $1", [
+        ids.patientA,
+      ]),
+    ).rejects.toThrow(/cannot grant itself/i);
+  });
+
+  it("may not demote a practitioner back to a patient", async () => {
+    await expect(
+      asDoctorA.query("update public.profiles set role = 'patient' where id = $1", [ids.doctorA]),
+    ).rejects.toThrow(/cannot grant itself/i);
+  });
+
+  it("may still correct its own name and number", async () => {
+    await asPatientA.query(
+      "update public.profiles set full_name = 'Salma Bennis-Alaoui', phone = '+212661020304' where id = $1",
+      [ids.patientA],
+    );
+    const { rows } = await admin.query<{ full_name: string; phone: string }>(
+      "select full_name, phone from public.profiles where id = $1",
+      [ids.patientA],
+    );
+    expect(rows[0].full_name).toBe("Salma Bennis-Alaoui");
+    expect(rows[0].phone).toBe("+212661020304");
+  });
+});
+
+describe("finding a practitioner", () => {
+  beforeEach(async () => {
+    await admin.query(
+      `update public.doctor_profiles set specialty = 'Cardiologie', city = 'Casablanca'
+       where id = $1`,
+      [ids.doctorA],
+    );
+    await admin.query(
+      `update public.doctor_profiles set display_name = 'Dr Youssef El Amrani',
+         specialty = 'Dermatologie', city = 'Oujda' where id = $1`,
+      [ids.doctorB],
+    );
+  });
+
+  const search = (specialty: string | null, city: string | null, name: string | null) =>
+    asPatientA.query<{ display_name: string }>(
+      "select display_name from public.search_practitioners($1, $2, $3)",
+      [specialty, city, name],
+    );
+
+  it("returns everyone verified when nothing is asked", async () => {
+    expect(await search(null, null, null)).toHaveLength(2);
+  });
+
+  it("narrows by specialty and by city", async () => {
+    expect((await search("Cardiologie", null, null)).map((r) => r.display_name)).toEqual([
+      "Dr Amina Benali",
+    ]);
+    expect((await search(null, "Oujda", null)).map((r) => r.display_name)).toEqual([
+      "Dr Youssef El Amrani",
+    ]);
+    expect(await search("Cardiologie", "Oujda", null)).toHaveLength(0);
+  });
+
+  it("finds a name typed without its accents, or in the wrong case", async () => {
+    // The ordinary case: someone half-remembers the name on a prescription.
+    for (const typed of ["benali", "BENALI", "Bénali", "  amina  "]) {
+      expect((await search(null, null, typed)).map((r) => r.display_name)).toEqual([
+        "Dr Amina Benali",
+      ]);
+    }
+  });
+
+  it("finds an accented name typed with its accents", async () => {
+    await admin.query("update public.doctor_profiles set display_name = $2 where id = $1", [
+      ids.doctorA,
+      "Dr Zoubida Férhaoui",
+    ]);
+    expect((await search(null, null, "férhaoui")).map((r) => r.display_name)).toEqual([
+      "Dr Zoubida Férhaoui",
+    ]);
+    expect((await search(null, null, "ferhaoui")).map((r) => r.display_name)).toEqual([
+      "Dr Zoubida Férhaoui",
+    ]);
+  });
+
+  it("treats a blank filter as no filter rather than as an impossible one", async () => {
+    expect(await search("", "   ", "")).toHaveLength(2);
+  });
+
+  it("does not show a practitioner their own unverified profile as a result", async () => {
+    await admin.query("update public.doctor_profiles set verified = false where id = $1", [
+      ids.doctorA,
+    ]);
+    // Doctor A can still read their own row directly — they need to — but
+    // searching is searching.
+    expect(
+      await asDoctorA.query("select id from public.doctor_profiles where id = $1", [ids.doctorA]),
+    ).toHaveLength(1);
+    expect(
+      await asDoctorA.query("select display_name from public.search_practitioners(null,null,null)"),
+    ).toHaveLength(1);
+  });
+
+  it("is open to a visitor who has not signed in", async () => {
+    const asVisitor = new AsUser(session, ids.patientA, "anon");
+    expect(
+      await asVisitor.query("select display_name from public.search_practitioners(null,null,null)"),
+    ).toHaveLength(2);
+  });
+});
+
+describe("the notification outbox", () => {
+  async function seedConfirmable(hoursAhead = 24): Promise<string> {
+    const {
+      rows: [row],
+    } = await admin.query<{ id: string }>(
+      `insert into public.appointments (patient_id, doctor_id, start_at, end_at)
+       values ($1, $2,
+               date_trunc('minute', now()) + ($3 || ' hours')::interval,
+               date_trunc('minute', now()) + ($3 || ' hours')::interval + interval '30 minutes')
+       returning id`,
+      [ids.patientA, ids.doctorA, hoursAhead],
+    );
+    return row.id;
+  }
+
+  interface Queued {
+    template: string;
+    recipient_id: string;
+    to_phone: string | null;
+    status: string;
+  }
+
+  function queued(appointmentId?: string): Promise<Queued[]> {
+    const columns = "template, recipient_id, to_phone, status";
+    return appointmentId
+      ? admin
+          .query<Queued>(
+            `select ${columns} from public.notifications
+              where appointment_id = $1 order by id`,
+            [appointmentId],
+          )
+          .then((r) => r.rows)
+      : admin
+          .query<Queued>(`select ${columns} from public.notifications order by id`)
+          .then((r) => r.rows);
+  }
+
+  beforeEach(async () => {
+    await admin.query("delete from public.notifications");
+    await admin.query("delete from public.appointments");
+    await admin.query("delete from public.doctor_absences");
+  });
+
+  describe("who hears about what", () => {
+    it("tells the practitioner a request has arrived", async () => {
+      const id = await seedConfirmable();
+      const rows = await queued(id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].template).toBe("appointment.requested");
+      expect(rows[0].recipient_id).toBe(ids.doctorA);
+    });
+
+    it("tells the patient when it is confirmed", async () => {
+      const id = await seedConfirmable();
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      const rows = await queued(id);
+      expect(rows.map((r) => r.template)).toEqual([
+        "appointment.requested",
+        "appointment.confirmed",
+      ]);
+      expect(rows[1].recipient_id).toBe(ids.patientA);
+    });
+
+    it("tells the patient when the cabinet cancels", async () => {
+      const id = await seedConfirmable();
+      await asDoctorA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+      const rows = await queued(id);
+      expect(rows[1].template).toBe("appointment.cancelled_by_doctor");
+      expect(rows[1].recipient_id).toBe(ids.patientA);
+    });
+
+    it("tells the practitioner when the patient cancels, because a slot just freed", async () => {
+      const id = await seedConfirmable();
+      await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+      const rows = await queued(id);
+      expect(rows[1].template).toBe("appointment.cancelled_by_patient");
+      expect(rows[1].recipient_id).toBe(ids.doctorA);
+    });
+
+    it("does not tell anyone what they did themselves", async () => {
+      const id = await seedConfirmable();
+      await asPatientA.query("update public.appointments set status = 'cancelled' where id = $1", [
+        id,
+      ]);
+      const rows = await queued(id);
+      // The cancelling patient gets nothing; the practitioner gets both.
+      expect(rows.filter((r) => r.recipient_id === ids.patientA)).toHaveLength(0);
+    });
+
+    it("says nothing about an edit that changed no outcome", async () => {
+      const id = await seedConfirmable();
+      await asPatientA.query("update public.appointments set reason = 'controle' where id = $1", [
+        id,
+      ]);
+      expect(await queued(id)).toHaveLength(1); // only the original request
+    });
+  });
+
+  describe("a closure", () => {
+    it("warns the patients it lands on", async () => {
+      const id = await seedConfirmable(24);
+      await admin.query("delete from public.notifications");
+
+      await asDoctorA.query(
+        `insert into public.doctor_absences (doctor_id, starts_at, ends_at, reason)
+         values ($1, now() + interval '23 hours', now() + interval '25 hours', 'conference')`,
+        [ids.doctorA],
+      );
+
+      const rows = await queued(id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].template).toBe("closure.affected");
+      expect(rows[0].recipient_id).toBe(ids.patientA);
+    });
+
+    it("leaves alone the patients it does not", async () => {
+      await seedConfirmable(24);
+      await admin.query("delete from public.notifications");
+      await asDoctorA.query(
+        `insert into public.doctor_absences (doctor_id, starts_at, ends_at)
+         values ($1, now() + interval '200 hours', now() + interval '210 hours')`,
+        [ids.doctorA],
+      );
+      expect(await queued()).toHaveLength(0);
+    });
+
+    it("stops reminding people about a consultation it covers", async () => {
+      const id = await seedConfirmable(10);
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      await asDoctorA.query(
+        `insert into public.doctor_absences (doctor_id, starts_at, ends_at)
+         values ($1, now() + interval '9 hours', now() + interval '11 hours')`,
+        [ids.doctorA],
+      );
+      await admin.query("delete from public.notifications");
+
+      // The closure notice has been sent; a cheerful reminder afterwards
+      // would be the cabinet contradicting itself.
+      const { rows } = await admin.query<{ enqueue_due_reminders: number }>(
+        "select public.enqueue_due_reminders()",
+      );
+      expect(rows[0].enqueue_due_reminders).toBe(0);
+    });
+  });
+
+  describe("reminders", () => {
+    it("queues one for a confirmed consultation tomorrow", async () => {
+      const id = await seedConfirmable(10);
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      await admin.query("select public.enqueue_due_reminders()");
+      expect((await queued(id)).map((r) => r.template)).toContain("appointment.reminder");
+    });
+
+    it("queues it exactly once however often the sweep runs", async () => {
+      const id = await seedConfirmable(10);
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      for (let run = 0; run < 4; run += 1) {
+        await admin.query("select public.enqueue_due_reminders()");
+      }
+      const reminders = (await queued(id)).filter(
+        (r) => r.template === "appointment.reminder",
+      );
+      expect(reminders).toHaveLength(1);
+    });
+
+    it("says nothing about a request the cabinet has not answered", async () => {
+      // Reminding someone of a consultation nobody has agreed to is worse
+      // than silence.
+      await seedConfirmable(10);
+      const { rows } = await admin.query<{ enqueue_due_reminders: number }>(
+        "select public.enqueue_due_reminders()",
+      );
+      expect(rows[0].enqueue_due_reminders).toBe(0);
+    });
+
+    it("says nothing about next month", async () => {
+      const id = await seedConfirmable(24 * 30);
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      const { rows } = await admin.query<{ enqueue_due_reminders: number }>(
+        "select public.enqueue_due_reminders()",
+      );
+      expect(rows[0].enqueue_due_reminders).toBe(0);
+    });
+  });
+
+  describe("privacy", () => {
+    it("shows someone their own messages and nobody else's", async () => {
+      const id = await seedConfirmable();
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+
+      // Patient A was told it was confirmed; the practitioner was told it was
+      // requested. Neither sees the other's.
+      const patientSees = await asPatientA.query<{ template: string }>(
+        "select template from public.notifications",
+      );
+      expect(patientSees.map((r) => r.template)).toEqual(["appointment.confirmed"]);
+
+      const doctorSees = await asDoctorA.query<{ template: string }>(
+        "select template from public.notifications",
+      );
+      expect(doctorSees.map((r) => r.template)).toEqual(["appointment.requested"]);
+
+      expect(
+        await asPatientB.query("select template from public.notifications"),
+      ).toHaveLength(0);
+    });
+
+    it("is not something a recipient can write to", async () => {
+      const id = await seedConfirmable();
+      // No insert or update policy exists at all: a recipient who could mark
+      // their own reminder sent would simply not receive it.
+      await expect(
+        asPatientA.query(
+          `insert into public.notifications (recipient_id, template, to_phone)
+           values ($1, 'appointment.confirmed', '+212600000000')`,
+          [ids.patientA],
+        ),
+      ).rejects.toThrow(/row-level security|policy/i);
+
+      await asDoctorA.query("update public.notifications set status = 'sent'");
+      expect((await queued(id))[0].status).toBe("pending");
+    });
+
+    it("cannot be drained by a signed-in user", async () => {
+      await seedConfirmable();
+      for (const call of [
+        "select public.claim_notifications(10)",
+        "select public.mark_notification_sent(1)",
+        "select public.enqueue_due_reminders()",
+        "select public.enqueue_notification($1, null, 'appointment.confirmed', '{}'::jsonb)",
+      ]) {
+        await expect(
+          asPatientA.query(call, call.includes("$1") ? [ids.patientA] : []),
+        ).rejects.toThrow(/permission denied/i);
+      }
+    });
+  });
+
+  describe("draining", () => {
+    it("records the number on file at the time, not whatever it becomes", async () => {
+      const id = await seedConfirmable();
+      await asDoctorA.query("update public.appointments set status = 'confirmed' where id = $1", [
+        id,
+      ]);
+      const before = (await queued(id)).find((r) => r.template === "appointment.confirmed")!;
+
+      await asPatientA.query("update public.profiles set phone = '+212699999999' where id = $1", [
+        ids.patientA,
+      ]);
+      const after = (await queued(id)).find((r) => r.template === "appointment.confirmed")!;
+
+      // Yesterday's unsent message should not follow a patient to a number
+      // they have only just started using.
+      expect(after.to_phone).toBe(before.to_phone);
+      expect(after.to_phone).not.toBe("+212699999999");
+    });
+
+    it("hands each message to one drain only", async () => {
+      await seedConfirmable(24);
+      await seedConfirmable(26);
+
+      // Two drains overlapping, which is the normal case the moment a cron
+      // run takes longer than its interval. The first holds its transaction
+      // open; `for update skip locked` must send the second past the locked
+      // row to a different one, rather than blocking on it or handing out the
+      // same message twice.
+      await admin.query("begin");
+      const mine = await admin.query<{ id: string }>(
+        "select id from public.claim_notifications(1)",
+      );
+      const theirs = await rival.query<{ id: string }>(
+        "select id from public.claim_notifications(1)",
+      );
+      await admin.query("commit");
+
+      expect(mine.rows).toHaveLength(1);
+      expect(theirs.rows).toHaveLength(1);
+      expect(theirs.rows[0].id).not.toBe(mine.rows[0].id);
+    });
+
+    it("counts attempts, and gives up on a number that will never work", async () => {
+      const id = await seedConfirmable();
+      const {
+        rows: [claimed],
+      } = await admin.query<{ id: string; attempts: number }>(
+        "select id, attempts from public.claim_notifications(10)",
+      );
+      expect(claimed.attempts).toBe(1);
+
+      await admin.query("select public.mark_notification_failed($1, 'bad number', true)", [
+        claimed.id,
+      ]);
+      expect((await queued(id))[0].status).toBe("failed");
+
+      // And a failed row is not handed out again.
+      expect(await admin.query("select id from public.claim_notifications(10)")).toHaveProperty(
+        "rowCount",
+        0,
+      );
+    });
+
+    it("retries a transient failure rather than losing it", async () => {
+      const id = await seedConfirmable();
+      const {
+        rows: [claimed],
+      } = await admin.query<{ id: string }>("select id from public.claim_notifications(10)");
+      await admin.query("select public.mark_notification_failed($1, 'timeout', false)", [
+        claimed.id,
+      ]);
+      expect((await queued(id))[0].status).toBe("pending");
+      expect(await admin.query("select id from public.claim_notifications(10)")).toHaveProperty(
+        "rowCount",
+        1,
+      );
+    });
+
+    it("marks a message sent only once, with the time it went", async () => {
+      await seedConfirmable();
+      const {
+        rows: [claimed],
+      } = await admin.query<{ id: string }>("select id from public.claim_notifications(10)");
+      await admin.query("select public.mark_notification_sent($1)", [claimed.id]);
+
+      const { rows } = await admin.query<{ status: string; sent_at: Date | null }>(
+        "select status, sent_at from public.notifications where id = $1",
+        [claimed.id],
+      );
+      expect(rows[0].status).toBe("sent");
+      expect(rows[0].sent_at).toBeInstanceOf(Date);
+      expect(await admin.query("select id from public.claim_notifications(10)")).toHaveProperty(
+        "rowCount",
+        0,
+      );
     });
   });
 });

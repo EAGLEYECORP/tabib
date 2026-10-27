@@ -7,7 +7,10 @@
     "start": "next start apps/web",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "db:apply": "./supabase/test/apply.sh",
+    "db:seed": "./supabase/test/apply.sh \"$DATABASE_URL\" --seed",
+    "notify": "curl -fsS -X POST -H \"authorization: Bearer $NOTIFY_SECRET\" \"${TABIB_URL:-http://localhost:3000}/api/notifications\""
   },
   "dependencies": {
     "@supabase/ssr": "latest",

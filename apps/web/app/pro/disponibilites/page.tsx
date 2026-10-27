@@ -46,11 +46,12 @@ export default async function AvailabilityPage() {
 
   if (!profile) {
     return (
-      <main className="container">
+      <main className="container narrow">
         <h1>Mes disponibilités</h1>
-        <p className="notice danger">
-          Ce compte n&apos;est pas rattaché à un profil praticien.
-        </p>
+        <p>Créez d&apos;abord votre profil praticien.</p>
+        <a className="button" href="/pro/inscription">
+          Créer mon profil praticien
+        </a>
       </main>
     );
   }

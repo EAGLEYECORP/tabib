@@ -5,7 +5,12 @@ Next.js + Supabase + Vercel.
 
 ## What works today
 
-- **Search** verified practitioners by specialty and city.
+- **Search** verified practitioners by specialty, city and name — filters that
+  live in the URL, so "cardiologues à Casablanca" is a link. A half-remembered
+  name is matched without its accents, because that is how people type.
+- **Practitioner sign-up**: a doctor registers themselves, opens hours
+  straight away, and goes live once Tabib.ma verifies the profile. Until then
+  they are out of search and unbookable.
 - **Closures**: a holiday, Aïd, a conference or a lost afternoon hides the
   slots it covers without deleting the weekly hours underneath — and hands
   back the patients already booked inside it, with their numbers, because
@@ -28,24 +33,55 @@ Next.js + Supabase + Vercel.
   prescription or report back into the patient's record.
 - **Phone sign-in** by one-time SMS code, because the mobile number is how
   patients are identified here and many have no email address.
+- **Text messages** for the things people need to know without visiting the
+  site: a new request to the practitioner, a confirmation or a cancellation to
+  the patient, a cancellation back to the cabinet because a slot has just
+  freed, a reminder the day before, and a notice when a closure lands on
+  someone. Queued by the database, not by the pages.
 
 ## Running it
 
 ```bash
 npm install
-cp .env.example .env.local        # fill in the Supabase values
+cp .env.example .env.local        # fill in the three Supabase values
+npm run db:apply "$DATABASE_URL"  # tables, policies, bucket, triggers
+npm run db:seed                   # four practitioners with open hours
 npm run dev                       # http://localhost:3000
 ```
 
-Create a Supabase project, then run `supabase/schema.sql` against it once
-(SQL Editor, or `psql` with the project's connection string). It creates the
-tables, the row-level security policies, the private `medical-documents`
-Storage bucket and the audit trigger.
+`db:apply` is also how you apply a change to a database that already has the
+previous version: `schema.sql` and `seed.sql` are both written to be re-run.
+The seed exists because a fresh database leaves every page correct and empty —
+the search finds nobody, so there is no profile to open, so there is no slot
+to book. It creates four verified practitioners in four cities with hours over
+the coming fortnight, which is enough to walk the whole patient path. Those
+accounts cannot be signed in as: sign-in is a code sent to the number on the
+`auth.users` row, and the seeded rows deliberately have no number on them.
 
-Two settings in the Supabase dashboard are needed for sign-in to work:
-**Authentication → Providers → Phone** must be enabled, with an SMS provider
-configured. Without one, `signInWithOtp` returns an error and nobody can log
-in.
+Applied to a Supabase project, the schema's last section changes nothing.
+Applied to any other PostgreSQL it creates the `anon` and `authenticated`
+roles and grants them the tables — without which every query comes back
+"permission denied" and it looks as though the schema is broken.
+
+One setting in the Supabase dashboard is needed before anyone can sign in:
+**Authentication → Providers → Phone**, with an SMS provider configured.
+Without one, `signInWithOtp` returns an error and nobody can log in.
+
+### Sending the messages
+
+`POST /api/notifications` drains the outbox, and queues tomorrow's reminders
+while it is there, so there is one thing to schedule rather than two:
+
+```bash
+NOTIFY_SECRET=$(openssl rand -hex 32)   # put it in .env.local
+npm run notify                          # or point a cron at the endpoint
+```
+
+Every ten minutes is a reasonable interval, and running it more often is
+harmless — see **Telling people things** below for why. With no
+`SMS_PROVIDER` set the messages go to the server log, so the whole chain works
+before anyone has an SMS account; set `SMS_PROVIDER=twilio` and its three
+credentials to actually send.
 
 ## How booking works
 
@@ -145,6 +181,70 @@ action that fails is worse than one that was never offered. It is also where
 the English the enum is written in becomes the French a cabinet reads; showing
 `no_show` to a practitioner is a bug, not a detail.
 
+## Who may become a practitioner
+
+`doctor_profiles` had exactly one policy: the public read of verified
+practitioners. So no doctor could create a profile, and a doctor whose profile
+someone else had inserted could not read their own row until it was verified —
+their own pages asked for it, got nothing, and told them their account was not
+attached to a practitioner profile. The product could not onboard the people
+it exists for.
+
+Registering is now a request rather than an admission. `register_practitioner`
+always writes the profile unverified and never takes `verified` as an
+argument, so registering again to correct a city cannot cost a practitioner
+their verification. Waving yourself through is the one thing a policy cannot
+express — `verified` has to be compared before and after — so a trigger
+freezes it.
+
+Anyone being able to register means "a practitioner exists" stops being the
+same statement as "a practitioner may be booked", and the appointment insert
+policy now says so outright. It had been true only by accident: an unverified
+profile is hidden from search and its pages 404, so nobody could reach one.
+A practitioner who can take a booking can read the documents a patient
+attaches to it, and that must never rest on a page returning the right status
+code.
+
+Two related things were fixed in passing. `own profile update` let anyone
+write any column of their own row, `role` among them, including
+`platform_admin`; nothing in the schema grants anything on the strength of
+`role` today, so it was not a way in — it was a loaded gun, and the first
+policy written as `role = 'platform_admin'` would have fired it. And
+PostgreSQL grants `EXECUTE` on a new function to `PUBLIC`, which made every
+`grant execute … to authenticated` in this file decorative; the `revoke`
+beside each one is what actually limits it.
+
+## Telling people things
+
+Nothing was ever sent to anyone. A practitioner confirmed a booking and the
+patient found out by visiting the site again; a patient cancelled and the
+cabinet found out when nobody arrived.
+
+`public.notifications` is an outbox, and the rows are written by **triggers
+rather than by pages**. A notification that depends on every code path
+remembering to send it is a notification that will be missed, and the one that
+gets missed is the cancellation — the message with the most value in it.
+Nobody is told what they did themselves, which is why the trigger looks at
+`auth.uid()`: the same cancellation notifies the patient or the practitioner
+depending on which of them walked away.
+
+A row holds a template name and a payload, never a rendered sentence. The
+French is composed in `apps/web/lib/notifications/templates.ts` for the same
+reason wall-clock times are converted there — a reminder that says 14:00 for a
+15:00 consultation is worse than no reminder, and the server's copy of the
+time-zone database is exactly the thing that gets Morocco wrong. The messages
+are also written without accents, because one accented character takes a text
+message from 160 characters to 70 and would split every one of them in two; a
+test holds each to a single segment with a realistic name in it.
+
+Running the drain more often than necessary is harmless, by construction:
+reminders are queued under a unique index, claiming uses `for update skip
+locked` so two overlapping runs take different rows, and a message is marked
+sent only once a provider has accepted it — so a run that dies mid-batch
+leaves its rows pending rather than swallowing them. A number the provider
+will never accept is given up on at once instead of being retried five times
+in front of everything else.
+
 ## How document access is decided
 
 Every rule lives in the database, so a mistake in a page or an API route
@@ -192,7 +292,7 @@ consultation is not rewritten.
 ## Tests
 
 ```bash
-npm test          # 211 tests
+npm test          # 272 tests
 npm run typecheck
 npm run build
 ```
@@ -226,12 +326,14 @@ connect — they do not silently skip.
 ## Layout
 
 ```
-supabase/schema.sql          Tables, RLS policies, Storage bucket, audit trigger
+supabase/schema.sql          Tables, RLS policies, Storage bucket, triggers
+supabase/seed.sql            Four practitioners, so the pages are not empty
 supabase/test/               The policies, run against real PostgreSQL
 apps/web/app/                Pages and API routes
 apps/web/lib/booking/        Slots, wall-clock conversion, appointment status
 apps/web/lib/documents/      Upload inspection and document vocabulary
-apps/web/lib/morocco/        Phone numbers in E.164
+apps/web/lib/notifications/  Message text and the SMS provider layer
+apps/web/lib/morocco/        Phone numbers, specialties and cities
 apps/web/components/         Uploader and document list
 ```
 
@@ -240,18 +342,15 @@ apps/web/components/         Uploader and document list
 - **No recurrence model.** Repeating a weekly pattern writes concrete blocks,
   so changing "every Tuesday" means removing and reopening them. Fine for a
   season's hours; it would not scale to a cabinet planning a year.
-- **Closures do not notify anyone.** The practitioner is shown who is affected
-  and is expected to call them. Nothing is sent automatically, because nothing
-  is sent automatically anywhere yet — see SMS below.
-- **No SMS.** A confirmed or refused booking changes what the patient sees on
-  the site and nothing more: no message, no reminder the day before, no notice
-  when a closure affects someone. For a market where no-shows are the problem
-  a booking platform exists to solve, this is the largest remaining gap.
+- **Practitioner verification is still a hand-set flag.** A doctor can now
+  register themselves, but someone has to set `verified` with SQL, and nothing
+  checks an INPE number against the CNOM register. There is no screen for it.
+- **Next.js has a published advisory** at the version in `package.json`, which
+  pins `latest` rather than a version — so what you get depends on when you
+  install. Both are worth fixing before this is deployed.
 - **Arabic.** The interface is French only. The document and appointment data
   carry nothing language-specific, so this is a presentation change, but it is
   a real gap in this market.
-- **Practitioner onboarding.** `doctor_profiles.verified` is a flag someone
-  sets by hand; nothing checks an INPE number against the CNOM register.
 - **Virus scanning.** Files are type-checked, not scanned.
 - **The browser flows are untested.** The database rules are covered
   thoroughly — including two patients racing for one slot — and so is the

@@ -773,6 +773,11 @@ as $$
   order by a.start_at;
 $$;
 
+-- PostgreSQL grants EXECUTE on a new function to PUBLIC, so naming
+-- `authenticated` adds nothing on its own: the revoke is what limits it. The
+-- function keys off auth.uid() and so returns nothing to a caller without a
+-- subject, but a practitioner's diary should not be reachable at all.
+revoke all on function public.appointments_in_period(timestamptz, timestamptz) from public;
 grant execute on function public.appointments_in_period(timestamptz, timestamptz) to authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -949,3 +954,624 @@ $$;
 create or replace trigger appointments_status_audit
   after update on public.appointments
   for each row execute function public.log_appointment_status_change();
+
+-- ---------------------------------------------------------------------------
+-- Becoming a practitioner
+--
+-- Until now there was no way to. `doctor_profiles` had exactly one policy —
+-- the public read of verified practitioners — and so no doctor could create a
+-- profile, and a doctor whose profile someone else had inserted could not
+-- read it until it was verified. The practitioner's own pages asked
+-- `doctor_profiles` for their row, got nothing back, and told them their
+-- account was not attached to a practitioner profile. The product could not
+-- onboard the people it exists for.
+--
+-- Self-registration is therefore a request, not an admission: a profile is
+-- created unverified, stays out of search, and cannot be booked. What a
+-- practitioner may not do is wave themselves through, which is the one thing
+-- a policy cannot express — `verified` must be compared before and after, so
+-- it is frozen by a trigger.
+-- ---------------------------------------------------------------------------
+
+create policy "doctor reads own profile" on public.doctor_profiles
+  for select using (auth.uid() = id);
+
+create policy "doctor updates own profile" on public.doctor_profiles
+  for update using (auth.uid() = id) with check (auth.uid() = id);
+
+create or replace function public.guard_doctor_profile_update()
+returns trigger
+language plpgsql
+as $$
+begin
+  -- As with appointments, a null subject is the service role or a migration,
+  -- which row-level security does not constrain either. Verification is
+  -- granted from outside the application; this is the door it comes through.
+  if auth.uid() is null then
+    return new;
+  end if;
+
+  if new.id <> old.id or new.verified <> old.verified then
+    raise exception 'a practitioner cannot verify themselves'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger guard_doctor_profile_update
+  before update on public.doctor_profiles
+  for each row execute function public.guard_doctor_profile_update();
+
+/**
+ * Registering as a practitioner, or correcting one's own details later.
+ *
+ * One call so that the profile and the account's role move together, and so
+ * `verified` is never among the columns the caller supplies: a second
+ * registration edits the details and leaves verification exactly as an
+ * administrator left it.
+ */
+create or replace function public.register_practitioner(
+  p_display_name text,
+  p_specialty text,
+  p_city text,
+  p_bio text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  name text := nullif(btrim(p_display_name), '');
+  specialty text := nullif(btrim(p_specialty), '');
+  city text := nullif(btrim(p_city), '');
+begin
+  if uid is null then
+    raise exception 'sign in before registering as a practitioner'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if name is null or specialty is null or city is null then
+    raise exception 'a practitioner needs a name, a specialty and a city'
+      using errcode = 'check_violation';
+  end if;
+
+  insert into public.doctor_profiles (id, display_name, specialty, city, bio, verified)
+  values (uid, name, specialty, city, nullif(btrim(coalesce(p_bio, '')), ''), false)
+  on conflict (id) do update
+    set display_name = excluded.display_name,
+        specialty = excluded.specialty,
+        city = excluded.city,
+        bio = excluded.bio;
+
+  update public.profiles set role = 'doctor' where id = uid and role = 'patient';
+end;
+$$;
+
+revoke all on function public.register_practitioner(text, text, text, text) from public;
+grant execute on function public.register_practitioner(text, text, text, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- What an account may say about itself
+--
+-- `own profile update` let anyone write any column of their own row, `role`
+-- among them — including 'platform_admin'. Nothing in this schema grants
+-- anything on the strength of `role` today, so it was not a way in; it was a
+-- loaded gun, and the first policy written as `role = 'platform_admin'` would
+-- have fired it. Self-service covers exactly one promotion, patient to
+-- practitioner, and that is all this allows.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.guard_profile_update()
+returns trigger
+language plpgsql
+as $$
+begin
+  if auth.uid() is null then
+    return new;
+  end if;
+
+  if new.id <> old.id then
+    raise exception 'a profile cannot change hands'
+      using errcode = 'check_violation';
+  end if;
+
+  if new.role <> old.role
+     and not (old.role = 'patient' and new.role = 'doctor')
+  then
+    raise exception 'an account cannot grant itself this role'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger guard_profile_update
+  before update on public.profiles
+  for each row execute function public.guard_profile_update();
+
+-- Anyone may now register, so "a practitioner exists" stops being the same
+-- statement as "a practitioner may be booked". An unverified profile is
+-- hidden from search and its pages 404, which made it unreachable in
+-- practice; the insert policy now says so outright, because a doctor who can
+-- take a booking can read the documents the patient attaches to it, and that
+-- must never rest on a page returning the right status code.
+/**
+ * Whether this practitioner may be booked at all.
+ *
+ * A security definer function rather than a subquery on `doctor_profiles`,
+ * even though the subquery would work today: a patient sees exactly the
+ * verified practitioners, so `exists` would already mean `verified`. It would
+ * mean that by coincidence. The closure check in this file was written as a
+ * plain subquery for the same reason and was a no-op, because a patient
+ * cannot see closures — and the next hand to widen the public read of
+ * practitioners would turn this one into a no-op in the dangerous direction,
+ * silently. Asking a function that runs as its owner means the answer does
+ * not depend on who is asking.
+ */
+create or replace function public.is_doctor_bookable(p_doctor_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.doctor_profiles d
+    where d.id = p_doctor_id and d.verified
+  );
+$$;
+
+grant execute on function public.is_doctor_bookable(uuid) to anon, authenticated;
+
+drop policy if exists "patient appointments create" on public.appointments;
+
+create policy "patient appointments create" on public.appointments
+  for insert with check (
+    auth.uid() = patient_id
+    and start_at >= now() + public.booking_lead_time()
+    and public.is_doctor_bookable(appointments.doctor_id)
+    and exists (
+      select 1 from public.doctor_availability av
+      where av.doctor_id = appointments.doctor_id
+        and av.status = 'open'
+        and appointments.start_at >= av.start_at
+        and appointments.end_at <= av.end_at
+    )
+    and not public.is_doctor_closed(
+      appointments.doctor_id, appointments.start_at, appointments.end_at
+    )
+  );
+
+-- `clinics` has row-level security and, like `doctor_availability` before it,
+-- no policies at all: unreadable by everyone. Nothing reads it yet, which is
+-- the only reason it has not been noticed. A verified clinic is public
+-- information, the same as a verified practitioner.
+create policy "verified clinics public read" on public.clinics
+  for select using (verified = true);
+
+-- ---------------------------------------------------------------------------
+-- Finding a practitioner
+--
+-- The search page listed the first fifty verified practitioners in the
+-- country and offered no way to narrow them, which for a patient in Oujda
+-- looking for a dermatologist is not a search. Filtering happens here rather
+-- than in the page so that the name match can be accent-folded: a patient
+-- half-remembering a name is the normal case, and "benali", "Bénali" and
+-- "BENALI" all have to reach Dr Amina Benali.
+--
+-- `fold` does that without `unaccent`, which would be another extension to
+-- install on a self-hosted Postgres for the sake of thirty characters.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.fold(value text)
+returns text
+language sql
+immutable
+strict
+as $$
+  select lower(translate(
+    value,
+    'ÀÁÂÃÄÅàáâãäåÇçÈÉÊËèéêëÌÍÎÏìíîïÑñÒÓÔÕÖØòóôõöøÙÚÛÜùúûüÝýÿ',
+    'AAAAAAaaaaaaCcEEEEeeeeIIIIiiiiNnOOOOOOooooooUUUUuuuuYyy'
+  ));
+$$;
+
+grant execute on function public.fold(text) to anon, authenticated;
+
+/**
+ * Verified practitioners matching any combination of the three filters.
+ *
+ * Deliberately *not* security definer: the public read policy already limits
+ * this to verified practitioners, so running as the caller means the search
+ * cannot show more than the caller could read anyway. `verified` is named in
+ * the predicate as well, because a practitioner can read their own
+ * unverified row and should not find themselves in a patient's search.
+ */
+create or replace function public.search_practitioners(
+  p_specialty text default null,
+  p_city text default null,
+  p_name text default null
+)
+returns table (
+  id uuid,
+  display_name text,
+  specialty text,
+  city text,
+  bio text
+)
+language sql
+stable
+set search_path = public
+as $$
+  select d.id, d.display_name, d.specialty, d.city, d.bio
+  from public.doctor_profiles d
+  where d.verified
+    and (nullif(btrim(coalesce(p_specialty, '')), '') is null
+         or d.specialty = btrim(p_specialty))
+    and (nullif(btrim(coalesce(p_city, '')), '') is null
+         or d.city = btrim(p_city))
+    and (nullif(btrim(coalesce(p_name, '')), '') is null
+         or public.fold(d.display_name) like '%' || public.fold(btrim(p_name)) || '%')
+  order by d.display_name
+  limit 100;
+$$;
+
+grant execute on function public.search_practitioners(text, text, text) to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Telling people things
+--
+-- Nothing was ever sent to anyone. A practitioner confirmed a booking and the
+-- patient found out by visiting the site again; a patient cancelled and the
+-- cabinet found out when nobody arrived. For a market where the no-show is
+-- the problem a booking platform exists to solve, that was the largest hole
+-- left in it.
+--
+-- This is an outbox, not a sender. Rows are written by triggers rather than
+-- by pages, because a notification that depends on every code path
+-- remembering to send it is a notification that will be missed — and the one
+-- that gets missed is the cancellation, which is the one that matters. A
+-- separate process drains the table; until an SMS provider is configured it
+-- logs, and the rows pile up harmlessly rather than being lost.
+--
+-- A row holds a template name and a payload, never a rendered sentence. The
+-- French is composed in TypeScript for the same reason wall-clock times are
+-- converted there: `Intl` and the server's copy of the time-zone database
+-- disagree about Morocco, and a reminder that says 14:00 for a 15:00
+-- consultation is worse than no reminder at all.
+-- ---------------------------------------------------------------------------
+
+create table if not exists public.notifications (
+  id bigint generated always as identity primary key,
+  recipient_id uuid not null references public.profiles(id) on delete cascade,
+  appointment_id uuid references public.appointments(id) on delete cascade,
+  -- Which message this is. Rendered by apps/web/lib/notifications/templates.ts.
+  template text not null,
+  payload jsonb not null default '{}'::jsonb,
+  channel text not null default 'sms' check (channel in ('sms')),
+  -- Copied at enqueue time: a patient who changes their number later should
+  -- not have yesterday's unsent reminder follow them to it.
+  to_phone text,
+  status text not null default 'pending'
+    check (status in ('pending', 'sent', 'failed')),
+  attempts integer not null default 0,
+  last_error text,
+  created_at timestamptz not null default now(),
+  sent_at timestamptz
+);
+
+-- One of each message per appointment. This is what makes the triggers safe
+-- to re-enter and the reminder sweep safe to run as often as you like: a
+-- second attempt to enqueue the same thing does nothing.
+create unique index if not exists notifications_once_per_appointment
+  on public.notifications (appointment_id, template)
+  where appointment_id is not null;
+
+create index if not exists notifications_pending
+  on public.notifications (created_at)
+  where status = 'pending';
+
+alter table public.notifications enable row level security;
+
+-- Someone may read what was sent to them, and nothing else. There is no
+-- insert or update policy at all: rows are written by triggers and by the
+-- drain, both of which run outside row-level security, and a notification a
+-- recipient could edit would not be worth sending.
+create policy "own notifications read" on public.notifications
+  for select using (auth.uid() = recipient_id);
+
+/**
+ * Queues one message, unless it is already queued.
+ *
+ * The phone number is looked up here rather than passed in, so no caller can
+ * aim a notification at a number of its choosing.
+ */
+create or replace function public.enqueue_notification(
+  p_recipient_id uuid,
+  p_appointment_id uuid,
+  p_template text,
+  p_payload jsonb default '{}'::jsonb
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  phone text;
+begin
+  select p.phone into phone from public.profiles p where p.id = p_recipient_id;
+
+  insert into public.notifications
+    (recipient_id, appointment_id, template, payload, to_phone)
+  values (p_recipient_id, p_appointment_id, p_template, p_payload, phone)
+  on conflict do nothing;
+end;
+$$;
+
+revoke all on function
+  public.enqueue_notification(uuid, uuid, text, jsonb) from public;
+
+/**
+ * What each side needs to be told as an appointment moves.
+ *
+ * The practitioner hears about arrivals and departures — a new request, and a
+ * cancellation that has just freed a slot. The patient hears about decisions
+ * made about them. Nobody is told what they did themselves.
+ */
+create or replace function public.notify_appointment_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  actor uuid := auth.uid();
+  details jsonb;
+begin
+  details := jsonb_build_object(
+    'start_at', new.start_at,
+    'doctor_name', (select d.display_name from public.doctor_profiles d where d.id = new.doctor_id),
+    'patient_name', (select p.full_name from public.profiles p where p.id = new.patient_id)
+  );
+
+  if tg_op = 'INSERT' then
+    perform public.enqueue_notification(
+      new.doctor_id, new.id, 'appointment.requested', details);
+    return new;
+  end if;
+
+  if new.status = old.status then
+    return new;
+  end if;
+
+  if new.status = 'confirmed' then
+    perform public.enqueue_notification(
+      new.patient_id, new.id, 'appointment.confirmed', details);
+
+  elsif new.status = 'cancelled' then
+    -- Who is told depends on who walked away, which is the whole point of
+    -- recording the actor.
+    if actor = new.patient_id then
+      perform public.enqueue_notification(
+        new.doctor_id, new.id, 'appointment.cancelled_by_patient', details);
+    else
+      perform public.enqueue_notification(
+        new.patient_id, new.id, 'appointment.cancelled_by_doctor', details);
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger notify_appointment_change
+  after insert or update on public.appointments
+  for each row execute function public.notify_appointment_change();
+
+/**
+ * Tells the patients a closure has just landed on.
+ *
+ * Their appointments survive a closure deliberately — those people have a
+ * place in the diary — so this does not cancel anything. It says the cabinet
+ * is closed and will be in touch, which is the honest message, and it means
+ * the practitioner's list of people to call is no longer the only thing
+ * standing between a patient and a locked door.
+ */
+create or replace function public.notify_closure()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  affected record;
+begin
+  for affected in
+    select a.id, a.patient_id, a.start_at
+    from public.appointments a
+    where a.doctor_id = new.doctor_id
+      and a.status in ('requested', 'confirmed')
+      and tstzrange(a.start_at, a.end_at, '[)')
+          && tstzrange(new.starts_at, new.ends_at, '[)')
+  loop
+    perform public.enqueue_notification(
+      affected.patient_id, affected.id, 'closure.affected',
+      jsonb_build_object(
+        'start_at', affected.start_at,
+        'doctor_name', (select d.display_name from public.doctor_profiles d
+                        where d.id = new.doctor_id)
+      ));
+  end loop;
+
+  return new;
+end;
+$$;
+
+create or replace trigger notify_closure
+  after insert on public.doctor_absences
+  for each row execute function public.notify_closure();
+
+/**
+ * Queues tomorrow's reminders.
+ *
+ * Called by the drain, so there is one thing to schedule rather than two. The
+ * unique index makes it idempotent: running it every ten minutes queues each
+ * reminder once, and a run that is missed catches up on the next one.
+ *
+ * Deliberately not sent for a request still awaiting an answer — reminding
+ * someone of a consultation the cabinet has not agreed to would be worse than
+ * silence.
+ */
+create or replace function public.enqueue_due_reminders(
+  p_within interval default interval '24 hours'
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  queued integer := 0;
+  appointment record;
+begin
+  for appointment in
+    select a.id, a.patient_id, a.start_at,
+           (select d.display_name from public.doctor_profiles d where d.id = a.doctor_id)
+             as doctor_name
+    from public.appointments a
+    where a.status = 'confirmed'
+      and a.start_at > now()
+      and a.start_at <= now() + p_within
+      and not public.is_doctor_closed(a.doctor_id, a.start_at, a.end_at)
+  loop
+    perform public.enqueue_notification(
+      appointment.patient_id, appointment.id, 'appointment.reminder',
+      jsonb_build_object(
+        'start_at', appointment.start_at,
+        'doctor_name', appointment.doctor_name
+      ));
+    queued := queued + 1;
+  end loop;
+
+  return queued;
+end;
+$$;
+
+revoke all on function public.enqueue_due_reminders(interval) from public;
+
+/**
+ * Hands the drain the next batch and marks it in flight.
+ *
+ * `for update skip locked` so two drains running at once cannot send the same
+ * message twice — the second one simply takes different rows. A message is
+ * marked sent only once a provider has accepted it, so a drain that dies
+ * mid-batch leaves its rows pending rather than silently swallowing them.
+ */
+create or replace function public.claim_notifications(p_limit integer default 50)
+returns setof public.notifications
+language sql
+volatile
+security definer
+set search_path = public
+as $$
+  with batch as (
+    select n.id from public.notifications n
+    where n.status = 'pending' and n.attempts < 5
+    order by n.created_at
+    limit greatest(1, least(coalesce(p_limit, 50), 500))
+    for update skip locked
+  )
+  update public.notifications n
+     set attempts = n.attempts + 1
+   where n.id in (select id from batch)
+  returning n.*;
+$$;
+
+revoke all on function public.claim_notifications(integer) from public;
+
+create or replace function public.mark_notification_sent(p_id bigint)
+returns void
+language sql
+volatile
+security definer
+set search_path = public
+as $$
+  update public.notifications
+     set status = 'sent', sent_at = now(), last_error = null
+   where id = p_id;
+$$;
+
+revoke all on function public.mark_notification_sent(bigint) from public;
+
+/**
+ * Records a failure.
+ *
+ * A row goes back to pending so the next drain retries it, until five
+ * attempts have been made — one unreachable number must not hold up the queue
+ * behind it forever. `p_permanent` is for a refusal that will never become a
+ * success, a malformed number being the usual one: retrying that four more
+ * times is just four more delays.
+ */
+create or replace function public.mark_notification_failed(
+  p_id bigint,
+  p_error text,
+  p_permanent boolean default false
+)
+returns void
+language sql
+volatile
+security definer
+set search_path = public
+as $$
+  update public.notifications
+     set status = case
+                    when p_permanent or attempts >= 5 then 'failed'
+                    else 'pending'
+                  end,
+         last_error = left(coalesce(p_error, 'unknown'), 500)
+   where id = p_id;
+$$;
+
+revoke all on function
+  public.mark_notification_failed(bigint, text, boolean) from public;
+
+-- ---------------------------------------------------------------------------
+-- Who may reach the tables at all
+--
+-- Row-level security decides which rows; a plain GRANT decides whether the
+-- role can see the table in the first place, and these two are easy to
+-- confuse because Supabase hands out the grants itself. Applied to a Supabase
+-- project this section changes nothing. Applied to any other PostgreSQL —
+-- self-hosted, or the one the tests run against — it is the difference
+-- between a working database and one where every query is "permission denied
+-- for table doctor_profiles".
+--
+-- It is last in the file on purpose: `all tables in schema public` grants on
+-- the tables that exist when it runs, so it has to run once everything does.
+-- ---------------------------------------------------------------------------
+
+do $$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'anon') then
+    create role anon noinherit nologin;
+  end if;
+  if not exists (select 1 from pg_roles where rolname = 'authenticated') then
+    create role authenticated noinherit nologin;
+  end if;
+end
+$$;
+
+grant usage on schema public to anon, authenticated;
+
+-- Wide on purpose, and safe only because of row-level security: every table
+-- here has it enabled, so a grant without a matching policy reaches nothing.
+-- `audit_logs` and `notifications` are the proof — both are granted below and
+-- neither has a policy that lets anyone write to them.
+grant select on all tables in schema public to anon;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+grant usage, select on all sequences in schema public to authenticated;

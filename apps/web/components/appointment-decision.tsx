@@ -21,8 +21,8 @@ import {
  * started, and nothing shows at all once the appointment is closed.
  *
  * Cancelling and marking a patient absent ask twice. Both are final in the
- * database, and neither sends the patient anything, so a mis-click costs
- * someone a phone call they will not know to expect.
+ * database, and cancelling now sends the patient a text message, so a
+ * mis-click is not something that can be quietly taken back.
  */
 export function AppointmentDecision({
   appointmentId,
@@ -53,8 +53,7 @@ export function AppointmentDecision({
       {state.done && (
         <p className="notice success" role="status">
           {statusLabel(state.done, "doctor")}.
-          {state.done === "cancelled" &&
-            " Prévenez le patient : rien ne lui est envoyé automatiquement."}
+          {state.done === "cancelled" && " Le patient est prévenu par SMS."}
         </p>
       )}
 
@@ -90,8 +89,10 @@ export function AppointmentDecision({
                   </strong>
                 </p>
                 <p className="muted">
-                  C&apos;est définitif, et le patient n&apos;en est pas prévenu
-                  automatiquement.
+                  C&apos;est définitif.
+                  {item.action === "cancel"
+                    ? " Le patient reçoit aussitôt un SMS."
+                    : " Le patient n'en est pas informé."}
                 </p>
                 <div className="row">
                   <Submit name="status" value={item.status} className="danger-button">

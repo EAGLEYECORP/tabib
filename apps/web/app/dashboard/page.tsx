@@ -1,5 +1,12 @@
 import { createClient } from '../../lib/supabase/server';
 import { dayLabel, formatTime } from '../../lib/booking/slots';
+import {
+  isAppointmentStatus,
+  isClosed,
+  statusLabel,
+  statusTone,
+  type AppointmentStatus,
+} from '../../lib/booking/status';
 
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Mes rendez-vous · Tabib.ma', robots: { index: false } };
@@ -33,13 +40,23 @@ export default async function Dashboard() {
     doctor_profiles: { display_name: string; specialty: string; city: string } | null;
   };
 
-  const all = (data ?? []) as unknown as Row[];
+  const all = (data ?? []).map((row) => {
+    const appointment = row as unknown as Row;
+    return {
+      ...appointment,
+      appointmentStatus: isAppointmentStatus(appointment.status)
+        ? appointment.status
+        : ('requested' as const),
+    };
+  });
   const now = Date.now();
+  // "À venir" means still going to happen: an appointment with an outcome
+  // already recorded belongs in the history, whatever its date.
   const upcoming = all.filter(
-    (a) => new Date(a.start_at).getTime() >= now && a.status !== 'cancelled',
+    (a) => new Date(a.start_at).getTime() >= now && !isClosed(a.appointmentStatus),
   );
   const past = all
-    .filter((a) => new Date(a.start_at).getTime() < now || a.status === 'cancelled')
+    .filter((a) => new Date(a.start_at).getTime() < now || isClosed(a.appointmentStatus))
     .reverse();
 
   return (
@@ -86,13 +103,13 @@ function Appointment({
   appointment: {
     id: string;
     start_at: string;
-    status: string;
+    appointmentStatus: AppointmentStatus;
     reason: string | null;
     doctor_profiles: { display_name: string; specialty: string; city: string } | null;
   };
 }) {
   const start = new Date(appointment.start_at);
-  const cancelled = appointment.status === 'cancelled';
+  const status = appointment.appointmentStatus;
 
   return (
     <div className="doc-head">
@@ -102,12 +119,14 @@ function Appointment({
           {appointment.doctor_profiles?.specialty}
           {appointment.doctor_profiles?.city ? ` · ${appointment.doctor_profiles.city}` : ''}
         </p>
-        <p className={cancelled ? 'muted struck' : ''}>
+        <p className={status === 'cancelled' ? 'muted struck' : ''}>
           {dayLabel(start)} à {formatTime(start)}
         </p>
         {appointment.reason && <p className="muted">{appointment.reason}</p>}
         <p className="chips">
-          <span className={cancelled ? 'chip' : 'chip success'}>{appointment.status}</span>
+          <span className={`chip ${statusTone(status) === 'neutral' ? '' : statusTone(status)}`}>
+            {statusLabel(status, 'patient')}
+          </span>
         </p>
       </div>
       <div className="doc-actions">

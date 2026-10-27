@@ -117,8 +117,9 @@ describe("what the practitioner is offered", () => {
     expect(destructive).toEqual(["no_show", "cancel"]);
   });
 
-  it("warns that cancelling tells the patient nothing", () => {
+  it("says that the patient is told, and that a call may still be owed", () => {
     const cancel = doctorActions("confirmed", tomorrow, now).find((a) => a.action === "cancel");
-    expect(cancel?.hint).toMatch(/automatiquement/);
+    expect(cancel?.hint).toMatch(/SMS/);
+    expect(cancel?.hint).toMatch(/Appelez/);
   });
 });

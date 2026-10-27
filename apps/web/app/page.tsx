@@ -13,6 +13,10 @@ export default function Home() {
       </p>
       <a className="button" href="/search">Rechercher un médecin</a>
       <a className="secondary spaced" href="/documents">Mes documents médicaux</a>
+      <p className="muted">
+        Vous êtes praticien ?{" "}
+        <a href="/pro/inscription">Inscrivez votre cabinet</a>.
+      </p>
     </main>
   );
 }

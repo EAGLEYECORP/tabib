@@ -10,9 +10,10 @@ import { closePeriod, type ClosureState } from "../app/pro/disponibilites/action
  * A closure hides free slots without touching the opening hours underneath,
  * so a practitioner keeps their Tuesday mornings after a week away. What it
  * deliberately does *not* do is cancel appointments already booked inside it:
- * those people have a place in the diary and are owed a phone call, not a
- * silent disappearance. The form hands back their names and numbers so that
- * call can actually happen.
+ * those people have a place in the diary. They are each sent a text message
+ * saying the cabinet is closed and will be in touch — and the form still
+ * hands back their names and numbers, because a closure someone needs
+ * rescheduling around is a conversation, not a notification.
  */
 export function ClosureForm({ today }: { today: string }) {
   const [state, action] = useActionState<ClosureState, FormData>(closePeriod, {});
@@ -42,7 +43,8 @@ export function ClosureForm({ today }: { today: string }) {
                 </strong>
               </p>
               <p>
-                Ils restent valables : à vous de prévenir ces patients et de les reprogrammer.
+                Ils restent valables. Ces patients reçoivent un SMS les informant de la
+                fermeture ; à vous de les rappeler pour les reprogrammer.
               </p>
               <ul className="affected">
                 {state.affected.map((appointment) => (

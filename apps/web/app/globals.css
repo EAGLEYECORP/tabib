@@ -60,3 +60,7 @@ label.inline input{width:auto}
 .decision-row.confirming{background:#fef3f2;border:1px solid #fecdca;border-radius:12px;padding:14px;gap:9px;width:100%}
 .decision-row.confirming p{margin:0}
 .decision form,.card form{display:grid;gap:6px;justify-items:start}
+textarea{font:inherit;width:100%;padding:11px 13px;border:1px solid #cfd5e1;border-radius:10px;background:#fff;resize:vertical}
+textarea:focus{outline:2px solid #172033;outline-offset:1px}
+.card h3{margin:0 0 6px;font-size:17px}
+form.card .row{margin-top:4px}
